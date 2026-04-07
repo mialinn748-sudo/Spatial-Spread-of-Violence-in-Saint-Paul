@@ -1,0 +1,478 @@
+<center>
+
+<h1>
+
+DASC 460: Analyzing the Spatial Spread of Violence in Saint Paul to Determine the Effectiveness of Establishing a Non-Fatal Shooting Unit
+
+</center>
+
+<center>
+
+<h1>
+
+Data Sandbox
+
+</center>
+
+### Load Relevant R Libraries
+
+```{r warning=FALSE, message=FALSE}
+library(rmarkdown); library(knitr); library(igraph); library(corrplot); library(moments); library(readxl); library(dplyr); library(ggplot2); library(lubridate); library(leaflet); library(readr); library(leaflet.extras2); library(sf); library(janitor); library(broom);library(MASS);
+
+```
+
+#### Load data
+
+```{r}
+shootings <- read_excel("Shootings_Full Data(new).xlsx", sheet = "Full Data")
+```
+
+#### Processing data
+
+```{r}
+model_data <- shootings %>%
+  mutate(
+    DATE = as.Date(DATE),
+    week = floor_date(DATE, unit = "week"),
+    trend = as.numeric(week - min(week)) / 7,
+    weekend = ifelse(wday(DATE) %in% c(1, 7), 1, 0),
+    unit = ifelse(DATE >= as.Date("2024-01-01"), 1, 0)
+  ) %>%
+  group_by(GRID, week) %>%
+  summarise(
+    y = n(),
+    trend = first(trend),
+    weekend = max(weekend),
+    unit = first(unit),
+    .groups = "drop"
+  )
+```
+
+#### Model 1
+
+```{r}
+# -----------------------------------------
+# 3. Fit Poisson regression
+# -----------------------------------------
+fit <- glm(
+  y ~ trend + weekend + unit + weekend:unit,
+  family = poisson(link = "log"),
+  data = model_data
+)
+
+# View model summary
+summary(fit)
+
+# -----------------------------------------
+# 4. Add fitted values and residuals
+# -----------------------------------------
+model_data <- model_data %>%
+  mutate(
+    pred = predict(fit, type = "response"),
+    resid_pearson = residuals(fit, type = "pearson")
+  )
+
+# -----------------------------------------
+# 5. Predicted vs observed plot
+# -----------------------------------------
+ggplot(model_data, aes(x = pred, y = y)) +
+  geom_point(alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  labs(
+    title = "Predicted vs Observed",
+    x = "Predicted",
+    y = "Observed"
+  )
+
+# -----------------------------------------
+# 6. Residuals vs fitted plot
+# -----------------------------------------
+ggplot(model_data, aes(x = pred, y = resid_pearson)) +
+  geom_point(alpha = 0.3) +
+  geom_hline(yintercept = 0, color = "red") +
+  labs(
+    title = "Residuals vs Fitted",
+    x = "Predicted",
+    y = "Residuals"
+  )
+
+# -----------------------------------------
+# 7. Coefficient plot
+# -----------------------------------------
+coef_df <- tidy(fit)
+
+ggplot(coef_df, aes(x = term, y = estimate)) +
+  geom_point() +
+  geom_errorbar(
+    aes(
+      ymin = estimate - std.error,
+      ymax = estimate + std.error
+    ),
+    width = 0.2
+  ) +
+  labs(
+    title = "Poisson Regression Coefficients",
+    x = "",
+    y = "Estimate (log scale)"
+  )
+
+# -----------------------------------------
+# 8. Model fit statistics
+# -----------------------------------------
+
+# Overdispersion statistic
+overdispersion <- sum(residuals(fit, type = "pearson")^2) / fit$df.residual
+overdispersion
+
+# Pseudo R-squared
+pseudo_r2 <- 1 - (fit$deviance / fit$null.deviance)
+pseudo_r2
+
+# AIC
+AIC(fit)
+
+# -----------------------------------------
+# 9. Exponentiated coefficients
+#    These are multiplicative effects
+# -----------------------------------------
+exp(coef(fit))
+
+# Optional: exponentiated coefficients with confidence intervals
+exp(cbind(Estimate = coef(fit), confint(fit)))
+
+# -----------------------------------------
+# 10. Optional: simple interpretation table
+# -----------------------------------------
+interpretation_table <- data.frame(
+  term = names(coef(fit)),
+  log_estimate = coef(fit),
+  exp_estimate = exp(coef(fit)),
+  p_value = summary(fit)$coefficients[, 4]
+)
+
+interpretation_table
+```
+
+#### Model 2
+
+```{r}
+all_data <- shootings %>%
+  mutate(
+    DATE = as.Date(DATE),
+    trend = as.numeric(DATE - min(DATE)),
+    weekend = ifelse(wday(DATE) %in% c(1,7), 1, 0),
+    unit = ifelse(DATE >= as.Date("2024-01-01"), 1, 0)
+  )
+
+# Create full grid of all GRID x DATE
+full_grid <- expand.grid(
+  GRID = unique(all_data$GRID),
+  DATE = seq(min(all_data$DATE), max(all_data$DATE), by = "day")
+)
+
+# Merge counts
+model_data_full <- full_grid %>%
+  left_join(all_data %>%
+              group_by(GRID, DATE) %>%
+              summarise(y = n(), .groups = "drop"),
+            by = c("GRID", "DATE")) %>%
+  mutate(
+    y = ifelse(is.na(y), 0, y),
+    trend = as.numeric(DATE - min(DATE)),
+    weekend = ifelse(wday(DATE) %in% c(1,7), 1, 0),
+    unit = ifelse(DATE >= as.Date("2024-01-01"), 1, 0)
+  )
+```
+
+```{r}
+fit_full <- glm(
+  y ~ trend + weekend + unit + weekend:unit,
+  family = poisson(link = "log"),
+  data = model_data_full
+)
+
+fit_spatial <- glm(
+  y ~ trend + weekend + unit + weekend:unit + factor(GRID),
+  family = poisson(link = "log"),
+  data = model_data_full
+)
+
+model_data_full <- model_data_full %>%
+  arrange(GRID, DATE) %>%
+  group_by(GRID) %>%
+  mutate(lag_y = lag(y, default = 0)) %>%
+  ungroup()
+
+fit_lag <- glm(
+  y ~ trend + weekend + unit + weekend:unit + lag_y,
+  family = poisson(link = "log"),
+  data = model_data_full
+)
+
+fit_nb <- glm.nb(
+  y ~ trend + weekend + unit + weekend:unit,
+  data = model_data_full
+)
+```
+
+```{r}
+model_data$pred <- predict(fit, type = "response")
+
+ggplot(model_data, aes(x = week)) +
+  geom_line(aes(y = y), color = "black") +
+  geom_line(aes(y = pred), color = "red") +
+  labs(title = "Actual vs Predicted Shootings",
+       y = "Count")
+```
+
+#### Model 3 (Selection)
+
+```{r}
+
+data_full <- shootings %>%
+  arrange(DATE, Time) %>%
+  mutate(
+    DATE = as.Date(DATE),
+    trend = as.numeric(DATE - min(DATE)),
+    weekend = ifelse(wday(DATE) %in% c(1,7), 1, 0),
+    unit = ifelse(DATE >= as.Date("2024-01-01"), 1, 0),
+    
+    # season
+    month = month(DATE),
+    season = case_when(
+      month %in% c(12,1,2) ~ "winter",
+      month %in% c(3,4,5) ~ "spring",
+      month %in% c(6,7,8) ~ "summer",
+      TRUE ~ "fall"
+    ),
+    
+    # time features
+    hour = hour(Time),
+    day = wday(DATE, label = TRUE),
+    
+    # clustering
+    time_since_last = as.numeric(difftime(DATE, lag(DATE), units = "days"))
+  )
+```
+
+```{r}
+# DAILY
+daily_data <- data_full %>%
+  group_by(DATE) %>%
+  summarise(
+    y = n(),
+    trend = first(trend),
+    weekend = first(weekend),
+    unit = first(unit),
+    season = first(season),
+    .groups = "drop"
+  )
+
+# WEEKLY
+weekly_data <- data_full %>%
+  mutate(week = floor_date(DATE, "week")) %>%
+  group_by(week) %>%
+  summarise(
+    y = n(),
+    trend = mean(trend),
+    weekend = mean(weekend),
+    unit = mean(unit),
+    season = first(season),
+    .groups = "drop"
+  )
+
+# MONTHLY
+monthly_data <- data_full %>%
+  mutate(month = floor_date(DATE, "month")) %>%
+  group_by(month) %>%
+  summarise(
+    y = n(),
+    trend = mean(trend),
+    weekend = mean(weekend),
+    unit = mean(unit),
+    season = first(season),
+    .groups = "drop"
+  )
+```
+
+```{r}
+library(MASS)
+
+run_model_selection <- function(data) {
+  
+  full_model <- glm(
+    y ~ trend + weekend + unit +
+        factor(season),
+    family = poisson(link = "log"),
+    data = data
+  )
+  
+  best_model <- stepAIC(full_model, direction = "both", trace = FALSE)
+  
+  return(best_model)
+}
+```
+
+```{r}
+model_daily   <- run_model_selection(daily_data)
+model_weekly  <- run_model_selection(weekly_data)
+model_monthly <- run_model_selection(monthly_data)
+
+AIC(model_daily, model_weekly, model_monthly)
+```
+
+```{r}
+daily_data <- daily_data %>%
+  arrange(DATE) %>%
+  mutate(lag_y = lag(y, default = 0))
+
+model_with_lag <- glm(
+  y ~ trend + weekend + unit + lag_y + factor(season),
+  family = poisson(link = "log"),
+  data = daily_data
+)
+
+summary(model_with_lag)
+AIC(model_with_lag)
+```
+
+```{r}
+model_interactions <- glm(
+  y ~ trend + weekend + unit +
+      weekend:unit + season:unit,
+  family = poisson(link = "log"),
+  data = daily_data
+)
+
+AIC(model_interactions)
+```
+
+Model Choosing
+
+```{r}
+
+data_full <- shootings %>%
+  arrange(DATE, Time) %>%
+  mutate(
+    DATE = as.Date(DATE),
+    trend = as.numeric(DATE - min(DATE)),
+    
+    # intervention
+    unit = ifelse(DATE >= as.Date("2024-01-01"), 1, 0),
+    
+    # weekend
+    weekend = ifelse(wday(DATE) %in% c(1,7), 1, 0),
+    
+    # season
+    month = month(DATE),
+    season = case_when(
+      month %in% c(12,1,2) ~ "winter",
+      month %in% c(3,4,5) ~ "spring",
+      month %in% c(6,7,8) ~ "summer",
+      TRUE ~ "fall"
+    ),
+    
+    # hour bins
+    hour = hour(Time),
+    time_bin = case_when(
+      hour >= 5 & hour < 12 ~ "morning",
+      hour >= 12 & hour < 17 ~ "afternoon",
+      hour >= 17 & hour < 21 ~ "evening",
+      TRUE ~ "night"
+    )
+  )
+```
+
+```{r}
+data_full <- data_full %>%
+  arrange(DATE, Time) %>%
+  mutate(
+    time_since_last = as.numeric(difftime(
+      as.POSIXct(paste(DATE, Time)),
+      lag(as.POSIXct(paste(DATE, Time))),
+      units = "hours"
+    ))
+  )
+```
+
+```{r}
+data_full <- data_full %>%
+  mutate(
+    lat_bin = cut(Lat, breaks = 10),
+    lon_bin = cut(Long, breaks = 10),
+    location_bin = interaction(lat_bin, lon_bin)
+  )
+```
+
+```{r}
+daily_data <- data_full %>%
+  group_by(DATE) %>%
+  summarise(
+    y = n(),
+    trend = first(trend),
+    weekend = first(weekend),
+    unit = first(unit),
+    season = first(season),
+    time_bin = names(which.max(table(time_bin))),  # dominant time
+    avg_time_since_last = mean(time_since_last, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(DATE) %>%
+  mutate(
+    lag_y = lag(y, default = 0)
+  )
+```
+
+```{r}
+full_model <- glm(
+  y ~ trend + weekend + unit +
+      factor(season) +
+      factor(time_bin) +
+      lag_y +
+      avg_time_since_last +
+      weekend:unit +
+      season:unit,
+  family = poisson(link = "log"),
+  data = daily_data
+)
+```
+
+```{r}
+best_model <- stepAIC(full_model, direction = "both", trace = FALSE)
+
+summary(best_model)
+AIC(best_model)
+```
+
+```{r}
+daily_data <- data_full %>%
+  group_by(DATE) %>%
+  summarise(
+    y = n(),
+    trend = first(trend),
+    weekend = first(weekend),
+    unit = first(unit),
+    season = first(season),
+    time_bin = names(which.max(table(time_bin))),
+    location_bin = names(which.max(table(location_bin))),  #  add this
+    .groups = "drop"
+  ) %>%
+  arrange(DATE) %>%
+  mutate(
+    lag_y = lag(y, default = 0)
+  )
+```
+
+```{r}
+spatial_model <- glm(
+  y ~ trend + weekend + unit +
+      factor(season) +
+      factor(time_bin) +
+      lag_y +
+      factor(location_bin),
+  family = poisson(link = "log"),
+  data = daily_data
+)
+
+AIC(spatial_model)
+```

@@ -1,0 +1,1069 @@
+---
+title: "DASC 460: Analyzing the Spatial Spread of Violence in Saint Paul to Determine the Effectiveness of Establishing a Non-Fatal Shooting Unit"
+output: html_document
+---
+
+------------------------------------------------------------------------
+
+# Setup
+
+## Load Libraries
+
+```{r warning=FALSE, message=FALSE}
+library(rmarkdown)
+library(knitr)
+library(igraph)
+library(corrplot)
+library(moments)
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(leaflet)
+library(readr)
+library(shiny)
+library(geosphere)
+library(tidyr)
+```
+
+## Load Data
+
+```{r}
+file <- "Shootings_Full Data(new).xlsx"
+excel_sheets(file)
+
+full_data <- read_excel(file, sheet = "Full Data")
+loc_time  <- read_excel(file, sheet = "Loc_Time")
+tables    <- read_excel(file, sheet = "Tables")
+```
+
+## Clean Data
+
+```{r}
+# Keep only rows with valid coordinates
+map_data <- full_data %>%
+  filter(!is.na(Lat), !is.na(Long), !is.na(DATE), Lat != 0, Long != 0) %>%
+  mutate(
+    DATE      = as.Date(DATE),
+    Year      = format(DATE, "%Y"),
+    month_day = format(DATE, "%m-%d")
+  )
+```
+
+## Set Time Variables
+
+```{r}
+all_dates <- sort(unique(map_data$DATE))
+years     <- sort(unique(map_data$Year))
+years4    <- years[1:min(4, length(years))]
+```
+
+------------------------------------------------------------------------
+
+# Section 1: Interactive Maps
+
+## Visualization 1 - Point Map
+
+Individual shooting incidents plotted as circle markers.
+
+```{r}
+leaflet(map_data) %>%
+  addTiles() %>%
+  addCircleMarkers(
+    lng         = ~Long,
+    lat         = ~Lat,
+    radius      = 3,
+    color       = "purple",
+    opacity     = 0.8,
+    fillOpacity = 0.4,
+    popup = ~paste(
+      "<b>CN:</b>", CN, "<br>",
+      "<b>Date:</b>", as.Date(DATE), "<br>",
+      "<b>Description:</b>", DESCRIPTION, "<br>",
+      "<b>Disposition:</b>", DISPOSITION
+    )
+  )
+```
+
+## Visualization 2 - Cluster Aggregation Map
+
+Markers grouped into clusters to show density by area.
+
+```{r}
+leaflet(map_data) %>%
+  addTiles() %>%
+  addMarkers(
+    lng            = ~Long,
+    lat            = ~Lat,
+    clusterOptions = markerClusterOptions(showCoverageOnHover = TRUE)
+  )
+```
+
+## Visualization 3 - Grid Aggregation Map
+
+Circle size reflects the number of incidents within each grid cell.
+
+```{r}
+grid_counts <- full_data %>%
+  filter(!is.na(GRID), !is.na(Lat), !is.na(Long)) %>%
+  group_by(GRID) %>%
+  summarize(
+    count = n(),
+    Lat   = mean(Lat),
+    Long  = mean(Long)
+  )
+
+leaflet(grid_counts) %>%
+  addTiles() %>%
+  addCircleMarkers(
+    lng         = ~Long,
+    lat         = ~Lat,
+    radius      = ~sqrt(count) * 2,
+    color       = "red",
+    fillOpacity = 0.5,
+    popup = ~paste(
+      "<b>GRID:</b>", GRID, "<br>",
+      "<b>Count:</b>", count
+    )
+  )
+```
+
+## Visualization 4 - Animated Small Multiples (Shiny App)
+
+Interactive Shiny app showing shooting progression before and after NFSU simultaneously. Use the slider or Play/Pause buttons to animate through time.
+
+```{r}
+# Use leap-year style full-year sequence so all month/day values exist
+slider_days   <- seq(as.Date("2024-01-01"), as.Date("2024-12-31"), by = "day")
+slider_labels <- format(slider_days, "%m-%d")
+
+# Split data into Before/After NFSU periods
+map_before <- map_data %>% filter(DATE < as.Date("2024-01-01"))
+map_after  <- map_data %>% filter(DATE >= as.Date("2024-01-01"))
+
+make_base_map <- function(df) {
+  leaflet() %>%
+    addTiles() %>%
+    setView(
+      lng  = mean(df$Long, na.rm = TRUE),
+      lat  = mean(df$Lat,  na.rm = TRUE),
+      zoom = 11
+    )
+}
+
+ui <- fluidPage(
+  titlePanel("Shootings Before vs After NFSU: Synchronized Time Progression"),
+
+  fluidRow(
+    column(3,
+      tags$b("Progress through year:"),
+      textOutput("date_label")
+    ),
+    column(3,
+      actionButton("play",  "Play"),
+      actionButton("pause", "Pause")
+    ),
+    column(6,
+      sliderInput("speed", "Animation speed (smaller = faster)",
+                  min = 100, max = 2000, value = 700, step = 100)
+    )
+  ),
+
+  sliderInput(
+    inputId = "day_index",
+    label   = "Move through the calendar year",
+    min     = 1,
+    max     = length(slider_labels),
+    value   = 1,
+    step    = 1,
+    animate = FALSE
+  ),
+
+  tabsetPanel(
+    tabPanel("Points",
+      fluidRow(
+        column(6, h4("Before NFSU"), leafletOutput("points_before", height = 450)),
+        column(6, h4("After NFSU"),  leafletOutput("points_after",  height = 450))
+      )
+    ),
+    tabPanel("Clusters",
+      fluidRow(
+        column(6, h4("Before NFSU"), leafletOutput("clusters_before", height = 450)),
+        column(6, h4("After NFSU"),  leafletOutput("clusters_after",  height = 450))
+      )
+    )
+  )
+)
+
+server <- function(input, output, session) {
+
+  playing <- reactiveVal(FALSE)
+
+  observeEvent(input$play,  { playing(TRUE)  })
+  observeEvent(input$pause, { playing(FALSE) })
+
+  observe({
+    if (playing()) {
+      invalidateLater(input$speed, session)
+      current <- input$day_index
+      if (current < length(slider_labels)) {
+        updateSliderInput(session, "day_index", value = current + 1)
+      } else {
+        playing(FALSE)
+      }
+    }
+  })
+
+  selected_month_day <- reactive({ slider_labels[input$day_index] })
+
+  output$date_label <- renderText({ selected_month_day() })
+
+  # Initialize blank base maps
+  output$points_before   <- renderLeaflet({ make_base_map(map_data) })
+  output$points_after    <- renderLeaflet({ make_base_map(map_data) })
+  output$clusters_before <- renderLeaflet({ make_base_map(map_data) })
+  output$clusters_after  <- renderLeaflet({ make_base_map(map_data) })
+
+  # Helper: filter a period's data up to the selected month-day
+  filtered_period_data <- function(df, month_day_cutoff) {
+    df %>% filter(month_day <= month_day_cutoff)
+  }
+
+  # Points — Before NFSU
+  observe({
+    df <- filtered_period_data(map_before, selected_month_day())
+    leafletProxy("points_before", data = df) %>%
+      clearMarkers() %>%
+      addCircleMarkers(
+        lng         = ~Long,
+        lat         = ~Lat,
+        radius      = 3,
+        color       = "red",
+        opacity     = 0.8,
+        fillOpacity = 0.4,
+        popup = ~paste(
+          "<b>Date:</b>", DATE, "<br>",
+          "<b>CN:</b>", CN, "<br>",
+          "<b>Description:</b>", DESCRIPTION, "<br>",
+          "<b>Disposition:</b>", DISPOSITION
+        )
+      )
+  })
+
+  # Points — After NFSU
+  observe({
+    df <- filtered_period_data(map_after, selected_month_day())
+    leafletProxy("points_after", data = df) %>%
+      clearMarkers() %>%
+      addCircleMarkers(
+        lng         = ~Long,
+        lat         = ~Lat,
+        radius      = 3,
+        color       = "blue",
+        opacity     = 0.8,
+        fillOpacity = 0.4,
+        popup = ~paste(
+          "<b>Date:</b>", DATE, "<br>",
+          "<b>CN:</b>", CN, "<br>",
+          "<b>Description:</b>", DESCRIPTION, "<br>",
+          "<b>Disposition:</b>", DISPOSITION
+        )
+      )
+  })
+
+  # Clusters — Before NFSU
+  observe({
+    df <- filtered_period_data(map_before, selected_month_day())
+    leafletProxy("clusters_before", data = df) %>%
+      clearMarkers() %>%
+      clearMarkerClusters() %>%
+      addMarkers(
+        lng   = ~Long,
+        lat   = ~Lat,
+        popup = ~paste(
+          "<b>Date:</b>", DATE, "<br>",
+          "<b>CN:</b>", CN, "<br>",
+          "<b>Description:</b>", DESCRIPTION, "<br>",
+          "<b>Disposition:</b>", DISPOSITION
+        ),
+        clusterOptions = markerClusterOptions(showCoverageOnHover = TRUE)
+      )
+  })
+
+  # Clusters — After NFSU
+  observe({
+    df <- filtered_period_data(map_after, selected_month_day())
+    leafletProxy("clusters_after", data = df) %>%
+      clearMarkers() %>%
+      clearMarkerClusters() %>%
+      addMarkers(
+        lng   = ~Long,
+        lat   = ~Lat,
+        popup = ~paste(
+          "<b>Date:</b>", DATE, "<br>",
+          "<b>CN:</b>", CN, "<br>",
+          "<b>Description:</b>", DESCRIPTION, "<br>",
+          "<b>Disposition:</b>", DISPOSITION
+        ),
+        clusterOptions = markerClusterOptions(showCoverageOnHover = TRUE)
+      )
+  })
+}
+
+shinyApp(ui, server)
+```
+
+------------------------------------------------------------------------
+
+# Section 2: Temporal Patterns
+
+## Prepare Temporal Variables
+
+```{r}
+map_data <- map_data %>%
+  mutate(
+    month  = floor_date(DATE, "month"),
+    period = ifelse(DATE < as.Date("2024-01-01"), "Before NFSU", "After NFSU"),
+    hour   = hour(Time),
+    day    = wday(DATE, label = TRUE, week_start = 1)
+  ) %>%
+  mutate(
+    period = factor(period, levels = c("Before NFSU", "After NFSU")),
+    day    = factor(day,    levels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"))
+  )
+
+monthly_counts <- map_data %>%
+  group_by(month) %>%
+  summarize(count = n(), .groups = "drop")
+```
+
+## Visualization 5.1 - Monthly Counts with NFSU Intervention Line
+
+```{r}
+ggplot(monthly_counts, aes(x = month, y = count)) +
+  geom_line() +
+  geom_smooth(se = FALSE) +
+  geom_vline(xintercept = as.Date("2024-01-01"), color = "red", linetype = "dashed") +
+  annotate("text", x = as.Date("2024-01-01"), y = max(monthly_counts$count),
+           label = "NFSU Start", color = "red", hjust = -0.1, size = 3) +
+  labs(title = "Monthly Shootings Over Time", x = "Month", y = "Count")
+```
+
+## Visualization 5.2 - Yearly Counts (Bar)
+
+```{r}
+year_period_counts <- map_data %>%
+  group_by(period, Year) %>%
+  summarize(count = n(), .groups = "drop")
+
+ggplot(year_period_counts, aes(x = Year, y = count)) +
+  geom_col() +
+  facet_wrap(~period, scales = "free_x") +
+  labs(title = "Yearly Shootings: Before vs After NFSU", x = "Year", y = "Count")
+```
+
+## Visualization 5.3 - Before vs After NFSU (Bar)
+
+```{r}
+period_counts <- map_data %>%
+  group_by(period) %>%
+  summarize(count = n(), .groups = "drop")
+
+ggplot(period_counts, aes(x = period, y = count, fill = period)) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_manual(values = c("Before NFSU" = "red", "After NFSU" = "blue")) +
+  labs(title = "Shootings Before vs After NFSU", x = "", y = "Count")
+```
+
+## Visualization 5.4 - Time of Day Pattern
+
+```{r}
+ggplot(map_data, aes(x = hour, fill = period)) +
+  geom_bar(position = "dodge") +
+  scale_fill_manual(values = c("Before NFSU" = "red", "After NFSU" = "blue")) +
+  labs(title = "Shootings by Hour of Day: Before vs After NFSU",
+       x = "Hour", y = "Count")
+```
+
+### Difference: Hour of Day (After - Before)
+
+```{r}
+hour_diff <- map_data %>%
+  group_by(period, hour) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  pivot_wider(names_from = period, values_from = count, values_fill = 0) %>%
+  mutate(diff = `After NFSU` - `Before NFSU`)
+
+ggplot(hour_diff, aes(x = hour, y = diff, fill = diff > 0)) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "blue")) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title    = "Change in Shootings by Hour of Day (After - Before NFSU)",
+    subtitle = "Red = increase, Blue = decrease",
+    x        = "Hour of Day",
+    y        = "Change in Count"
+  ) +
+  theme_minimal()
+```
+
+## Visualization 5.5 - Day of Week Pattern
+
+```{r}
+ggplot(map_data, aes(x = day, fill = period)) +
+  geom_bar(position = "dodge") +
+  scale_fill_manual(values = c("Before NFSU" = "red", "After NFSU" = "blue")) +
+  labs(title = "Shootings by Day of Week: Before vs After NFSU", x = "Day", y = "Count")
+```
+
+### Difference: Day of Week (After - Before)
+
+```{r}
+day_diff <- map_data %>%
+  group_by(period, day) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  pivot_wider(names_from = period, values_from = count, values_fill = 0) %>%
+  mutate(diff = `After NFSU` - `Before NFSU`)
+
+ggplot(day_diff, aes(x = day, y = diff, fill = diff > 0)) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "blue")) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title    = "Change in Shootings by Day of Week (After - Before NFSU)",
+    subtitle = "Red = increase, Blue = decrease",
+    x        = "Day of Week",
+    y        = "Change in Count"
+  ) +
+  theme_minimal()
+```
+
+## Visualization 5.6 - Seasonal Patterns
+
+```{r}
+map_data <- map_data %>%
+  mutate(
+    season = case_when(
+      month(DATE) %in% c(12, 1, 2)  ~ "Winter",
+      month(DATE) %in% c(3, 4, 5)   ~ "Spring",
+      month(DATE) %in% c(6, 7, 8)   ~ "Summer",
+      month(DATE) %in% c(9, 10, 11) ~ "Fall"
+    )
+  ) %>%
+  mutate(
+    season = factor(season, levels = c("Winter", "Spring", "Summer", "Fall")),
+    period = factor(period, levels = c("Before NFSU", "After NFSU"))
+  )
+
+season_counts <- map_data %>%
+  group_by(period, season) %>%
+  summarize(count = n(), .groups = "drop")
+
+ggplot(season_counts, aes(x = season, y = count, fill = period)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Before NFSU" = "red", "After NFSU" = "blue")) +
+  labs(title = "Seasonal Shootings: Before vs After NFSU", x = "Season", y = "Count") +
+  theme_minimal()
+```
+
+### Difference: Season (After - Before)
+
+```{r}
+season_diff <- season_counts %>%
+  pivot_wider(names_from = period, values_from = count, values_fill = 0) %>%
+  mutate(diff = `After NFSU` - `Before NFSU`)
+
+ggplot(season_diff, aes(x = season, y = diff, fill = diff > 0)) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "blue")) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title    = "Change in Shootings by Season (After - Before NFSU)",
+    subtitle = "Red = increase, Blue = decrease",
+    x        = "Season",
+    y        = "Change in Count"
+  ) +
+  theme_minimal()
+```
+
+------------------------------------------------------------------------
+
+# Section 3: Spatial Patterns
+
+## Visualization 5.7 - Spatial Density (Heat Map)
+
+```{r}
+ggplot(map_data, aes(x = Long, y = Lat)) +
+  stat_density_2d(aes(fill = after_stat(level)), geom = "polygon") +
+  scale_fill_viridis_c() +
+  facet_wrap(~period) +
+  labs(title = "Shooting Density Map: Before vs After NFSU", x = "Longitude", y = "Latitude") +
+  theme_minimal()
+```
+
+------------------------------------------------------------------------
+
+# Section 4: Time Between Events
+
+## Prepare Time-Gap Data
+
+```{r}
+shootings <- read_excel("Shootings_Full Data(new).xlsx", sheet = "Full Data")
+
+shootings_gaps <- shootings %>%
+  mutate(
+    DATE     = as.Date(DATE),
+    Time     = format(as.POSIXct(Time, format = "%H:%M:%S"), "%H:%M:%S"),
+    event_dt = ymd_hms(paste(DATE, Time)),
+    period   = factor(
+      ifelse(DATE < as.Date("2024-01-01"), "Before NFSU", "After NFSU"),
+      levels = c("Before NFSU", "After NFSU")
+    )
+  ) %>%
+  filter(!is.na(event_dt)) %>%
+  arrange(event_dt) %>%
+  mutate(
+    prev_event_dt = lag(event_dt),
+    gap_minutes   = as.numeric(difftime(event_dt, prev_event_dt, units = "mins")),
+    gap_hours     = as.numeric(difftime(event_dt, prev_event_dt, units = "hours")),
+    gap_days      = as.numeric(difftime(event_dt, prev_event_dt, units = "days"))
+  ) %>%
+  filter(!is.na(gap_hours))
+```
+
+## Visualization 6.1 - Time Between Events: Hours
+
+```{r}
+ggplot(shootings_gaps %>% filter(gap_hours <= 168), aes(x = gap_hours)) +
+  geom_histogram(binwidth = 4, fill = "steelblue", color = "white") +
+  facet_wrap(~period, scales = "fixed") +
+  labs(
+    title    = "Time Between Consecutive Shooting Events",
+    subtitle = "Before vs After NFSU",
+    x        = "Hours Since Previous Event",
+    y        = "Count"
+  ) +
+  theme_minimal()
+```
+
+## Visualization 6.2 - Time Between Events: First 24 Hours
+
+```{r}
+ggplot(shootings_gaps %>% filter(gap_minutes <= 1440), aes(x = gap_minutes)) +
+  geom_histogram(binwidth = 30, fill = "steelblue", color = "white") +
+  facet_wrap(~period, scales = "fixed") +
+  labs(
+    title    = "Time Between Consecutive Shooting Events",
+    subtitle = "First 24 Hours | Before vs After NFSU",
+    x        = "Minutes Since Previous Event",
+    y        = "Count"
+  ) +
+  theme_minimal()
+```
+
+## Data Quality Check
+
+```{r}
+summary(shootings$Time)
+sum(is.na(shootings$Time))
+sum(is.na(shootings_gaps$event_dt))
+table(shootings_gaps$period)
+nrow(shootings_gaps)
+```
+
+------------------------------------------------------------------------
+
+# Section 5: Distance Between Events
+
+## Prepare Distance Data
+
+```{r}
+shootings_space <- shootings %>%
+  mutate(
+    DATE     = as.Date(DATE),
+    Time     = format(as.POSIXct(Time, format = "%H:%M:%S"), "%H:%M:%S"),
+    event_dt = ymd_hms(paste(DATE, Time)),
+    period   = factor(
+      ifelse(DATE < as.Date("2024-01-01"), "Before NFSU", "After NFSU"),
+      levels = c("Before NFSU", "After NFSU")
+    )
+  ) %>%
+  filter(!is.na(event_dt), !is.na(Lat), !is.na(Long)) %>%
+  arrange(event_dt) %>%
+  mutate(
+    prev_lat    = lag(Lat),
+    prev_long   = lag(Long),
+    dist_meters = distHaversine(
+      matrix(c(prev_long, prev_lat), ncol = 2),
+      matrix(c(Long, Lat),           ncol = 2)
+    ),
+    dist_miles = dist_meters / 1609.34,
+    dist_feet  = dist_meters * 3.28084
+  ) %>%
+  filter(!is.na(dist_miles))
+```
+
+## Visualization 7.1 - Distance Between Events: Miles
+
+```{r}
+ggplot(shootings_space %>% filter(dist_miles <= 5), aes(x = dist_miles)) +
+  geom_histogram(binwidth = 0.25, fill = "steelblue", color = "white") +
+  facet_wrap(~period, scales = "fixed") +
+  labs(
+    title    = "Distance Between Consecutive Shooting Events",
+    subtitle = "Before vs After NFSU",
+    x        = "Miles from Previous Event",
+    y        = "Count"
+  ) +
+  theme_minimal()
+```
+
+## Visualization 7.2 - Distance Between Events: Miles (Normalized)
+
+Normalized to compare the *shape* of the spatial spread pattern independent of volume - useful for detecting whether shooting geography changed after NFSU.
+
+```{r}
+ggplot(shootings_space %>% filter(dist_miles <= 5),
+       aes(x = dist_miles, y = after_stat(density))) +
+  geom_histogram(binwidth = 0.25, fill = "steelblue", color = "white") +
+  facet_wrap(~period, scales = "fixed") +
+  labs(
+    title    = "Distribution of Distance Between Events",
+    subtitle = "Normalized Comparison | Before vs After NFSU",
+    x        = "Miles from Previous Event",
+    y        = "Density"
+  ) +
+  theme_minimal()
+```
+
+## Visualization 7.3 - Distance Between Events: Feet
+
+```{r}
+ggplot(shootings_space %>% filter(dist_feet <= 10000), aes(x = dist_feet)) +
+  geom_histogram(binwidth = 500, fill = "steelblue", color = "white") +
+  facet_wrap(~period, scales = "fixed") +
+  labs(
+    title    = "Distance Between Consecutive Shooting Events",
+    subtitle = "Before vs After NFSU",
+    x        = "Feet from Previous Event",
+    y        = "Count"
+  ) +
+  theme_minimal()
+```
+
+## Summary Statistics - Distance
+
+```{r}
+shootings_space %>%
+  group_by(period) %>%
+  summarize(
+    n                 = n(),
+    mean_dist_miles   = mean(dist_miles,   na.rm = TRUE),
+    median_dist_miles = median(dist_miles, na.rm = TRUE),
+    sd_dist_miles     = sd(dist_miles,     na.rm = TRUE),
+    min_dist_miles    = min(dist_miles,    na.rm = TRUE),
+    max_dist_miles    = max(dist_miles,    na.rm = TRUE)
+  )
+```
+
+------------------------------------------------------------------------
+
+# Section 6: Space-Time Heatmaps
+
+## Prepare Day × Hour Heatmap Data
+
+```{r}
+shootings_time <- shootings %>%
+  mutate(
+    DATE     = as.Date(DATE),
+    Time     = format(as.POSIXct(Time, format = "%H:%M:%S"), "%H:%M:%S"),
+    event_dt = ymd_hms(paste(DATE, Time)),
+    period   = if_else(DATE < as.Date("2024-01-01"), "Before NFSU", "After NFSU"),
+    hour     = hour(event_dt),
+    day      = wday(event_dt, label = TRUE, week_start = 1)
+  ) %>%
+  filter(!is.na(event_dt)) %>%
+  mutate(
+    day    = factor(day,    levels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")),
+    period = factor(period, levels = c("Before NFSU", "After NFSU"))
+  )
+
+heatmap_data <- shootings_time %>%
+  group_by(period, day, hour) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  mutate(
+    period = factor(period, levels = c("Before NFSU", "After NFSU")),
+    day    = factor(day,    levels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"))
+  )
+```
+
+## Visualization 8.1 - Day × Hour Heatmap (Raw Counts)
+
+```{r}
+ggplot(heatmap_data, aes(x = hour, y = day, fill = count)) +
+  geom_tile() +
+  facet_wrap(~period) +
+  scale_fill_viridis_c() +
+  labs(
+    title    = "Shootings by Day of Week and Hour",
+    subtitle = "Before vs After NFSU",
+    x        = "Hour of Day",
+    y        = "Day of Week",
+    fill     = "Count"
+  ) +
+  theme_minimal()
+```
+
+## Visualization 8.2 - Day × Hour Heatmap (Normalized)
+
+Normalized to compare *when* shootings cluster across the week — useful for spotting pattern shifts independent of volume differences.
+
+```{r}
+heatmap_data_norm <- heatmap_data %>%
+  group_by(period) %>%
+  mutate(prop = count / sum(count))
+
+ggplot(heatmap_data_norm, aes(x = hour, y = day, fill = prop)) +
+  geom_tile() +
+  facet_wrap(~period) +
+  scale_fill_viridis_c() +
+  labs(
+    title    = "Distribution of Shootings by Day & Hour",
+    subtitle = "Normalized | Before vs After NFSU",
+    x        = "Hour of Day",
+    y        = "Day of Week",
+    fill     = "Proportion"
+  ) +
+  theme_minimal()
+```
+
+## Visualization 8.3 - Day × Hour Difference Heatmap (After - Before)
+
+```{r}
+diff_data <- heatmap_data %>%
+  pivot_wider(names_from = period, values_from = count, values_fill = 0) %>%
+  mutate(diff = `After NFSU` - `Before NFSU`)
+
+ggplot(diff_data, aes(x = hour, y = day, fill = diff)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  labs(
+    title    = "Change in Shootings by Day & Hour (After - Before NFSU)",
+    subtitle = "Red = increase, Blue = decrease",
+    x        = "Hour",
+    y        = "Day",
+    fill     = "Change"
+  ) +
+  theme_minimal()
+```
+
+## Visualization 8.4 - Hourly Patterns by Day (Facet Grid)
+
+```{r}
+heatmap_data %>%
+  ggplot(aes(x = hour, y = count)) +
+  geom_line(color = "steelblue") +
+  facet_grid(day ~ period) +
+  labs(
+    title = "Hourly Shooting Patterns by Day",
+    x     = "Hour of Day",
+    y     = "Count"
+  )
+```
+
+------------------------------------------------------------------------
+
+# Section 7: Joint Space-Time Analysis
+
+## Prepare Space-Time Data
+
+```{r}
+space_time <- shootings %>%
+  mutate(
+    DATE     = as.Date(DATE),
+    Time     = format(as.POSIXct(Time, format = "%H:%M:%S"), "%H:%M:%S"),
+    event_dt = ymd_hms(paste(DATE, Time)),
+    period   = if_else(DATE < as.Date("2024-01-01"), "Before NFSU", "After NFSU")
+  ) %>%
+  filter(!is.na(event_dt), !is.na(Lat), !is.na(Long)) %>%
+  arrange(event_dt) %>%
+  mutate(
+    prev_event_dt = lag(event_dt),
+    prev_lat      = lag(Lat),
+    prev_long     = lag(Long),
+    gap_minutes   = as.numeric(difftime(event_dt, prev_event_dt, units = "mins")),
+    dist_meters   = distHaversine(
+      matrix(c(prev_long, prev_lat), ncol = 2),
+      matrix(c(Long, Lat),           ncol = 2)
+    ),
+    dist_miles = dist_meters / 1609.34
+  ) %>%
+  filter(!is.na(gap_minutes), !is.na(dist_miles)) %>%
+  mutate(period = factor(period, levels = c("Before NFSU", "After NFSU")))
+```
+
+## Visualization 9.1 - Time vs Distance (2D Bin)
+
+```{r}
+ggplot(space_time %>% filter(gap_minutes <= 1440, dist_miles <= 5),
+       aes(x = gap_minutes, y = dist_miles)) +
+  geom_bin2d() +
+  facet_wrap(~period) +
+  labs(
+    title    = "Time and Distance Between Consecutive Shooting Events",
+    subtitle = "First 24 Hours and Within 5 Miles | Before vs After NFSU",
+    x        = "Minutes Since Previous Event",
+    y        = "Miles From Previous Event",
+    fill     = "Count"
+  ) +
+  theme_minimal()
+```
+
+### Difference: 2D Bin (After - Before)
+
+```{r}
+bin_counts <- space_time %>%
+  filter(gap_minutes <= 1440, dist_miles <= 5) %>%
+  mutate(
+    gap_bin  = cut(gap_minutes, breaks = seq(0, 1440, by = 60),  include.lowest = TRUE),
+    dist_bin = cut(dist_miles,  breaks = seq(0, 5,    by = 0.5), include.lowest = TRUE)
+  ) %>%
+  group_by(period, gap_bin, dist_bin) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  pivot_wider(names_from = period, values_from = count, values_fill = 0) %>%
+  mutate(diff = `After NFSU` - `Before NFSU`)
+
+ggplot(bin_counts, aes(x = gap_bin, y = dist_bin, fill = diff)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  labs(
+    title    = "Change in Event Pairs by Time & Distance (After - Before NFSU)",
+    subtitle = "Red = more pairs After NFSU, Blue = fewer pairs After NFSU",
+    x        = "Minutes Since Previous Event",
+    y        = "Miles From Previous Event",
+    fill     = "Change"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Visualization 9.2 - Time vs Distance (Scatter)
+
+```{r}
+ggplot(space_time %>% filter(gap_minutes <= 1440, dist_miles <= 5),
+       aes(x = gap_minutes, y = dist_miles)) +
+  geom_point(alpha = 0.25, size = 1) +
+  facet_wrap(~period) +
+  labs(
+    title    = "Time and Distance Between Consecutive Shooting Events",
+    subtitle = "Before vs After NFSU",
+    x        = "Minutes Since Previous Event",
+    y        = "Miles From Previous Event"
+  ) +
+  theme_minimal()
+```
+
+# Section 9: Summary Statistics Table (Before vs After NFSU)
+
+## Prepare disposition data
+
+```{r}
+disposition_summary <- full_data %>%
+  mutate(
+    DATE   = as.Date(DATE),
+    period = factor(
+      ifelse(DATE < as.Date("2024-01-01"), "Before NFSU", "After NFSU"),
+      levels = c("Before NFSU", "After NFSU")
+    )
+  ) %>%
+  filter(!is.na(DISPOSITION)) %>%
+  group_by(period, DISPOSITION) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  group_by(period) %>%
+  mutate(pct = round(100 * count / sum(count), 1)) %>%
+  arrange(period, desc(count))
+```
+
+## Visualization 10.1 - Disposition breakdown Before vs After NFSU
+
+```{r}
+ggplot(disposition_summary, aes(x = reorder(DISPOSITION, count), y = pct, fill = period)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Before NFSU" = "red", "After NFSU" = "blue")) +
+  coord_flip() +
+  labs(
+    title    = "Case Disposition Breakdown: Before vs After NFSU",
+    subtitle = "As % of total cases in each period",
+    x        = "Disposition",
+    y        = "Percentage (%)",
+    fill     = "Period"
+  ) +
+  theme_minimal()
+```
+
+## Visualization 10.2 - Overall summary stats table
+
+```{r}
+summary_table <- map_data %>%
+  group_by(period) %>%
+  summarize(
+    total_incidents      = n(),
+    date_range           = paste(min(DATE), "to", max(DATE)),
+    avg_per_month        = round(n() / n_distinct(format(DATE, "%Y-%m")), 1),
+    pct_weekend          = round(100 * mean(wday(DATE) %in% c(1, 7)), 1),
+    pct_summer           = round(100 * mean(month(DATE) %in% c(6, 7, 8)), 1),
+    pct_late_night       = round(100 * mean(hour(Time) %in% c(21, 22, 23, 0, 1, 2), na.rm = TRUE), 1),
+    .groups              = "drop"
+  )
+
+kable(
+  summary_table,
+  col.names = c("Period", "Total Incidents", "Date Range",
+                "Avg/Month", "% Weekend", "% Summer", "% Late Night (9pm–2am)"),
+  caption   = "Summary Statistics: Before vs After NFSU"
+)
+```
+
+## Visualization 10.3 - Top grid cells Before vs After (potential covariates)
+
+```{r}
+top_grids <- full_data %>%
+  mutate(
+    DATE   = as.Date(DATE),
+    period = factor(
+      ifelse(DATE < as.Date("2024-01-01"), "Before NFSU", "After NFSU"),
+      levels = c("Before NFSU", "After NFSU")
+    )
+  ) %>%
+  filter(!is.na(GRID)) %>%
+  group_by(period, GRID) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  group_by(period) %>%
+  slice_max(count, n = 10) %>%
+  ungroup() %>%
+  mutate(GRID = factor(GRID))
+```
+
+```{r}
+ggplot(top_grids, aes(x = reorder(GRID, count), y = count, fill = period)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Before NFSU" = "red", "After NFSU" = "blue")) +
+  coord_flip() +
+  labs(
+    title    = "Top 10 Grid Cells by Incident Count: Before vs After NFSU",
+    subtitle = "Identifies persistent spatial hotspots — candidates for background intensity covariates",
+    x        = "Grid Cell",
+    y        = "Count",
+    fill     = "Period"
+  ) +
+  theme_minimal()
+```
+
+# Section 10: Case Resolution Time (DATE CLOSED - DATE)
+
+```{r}
+resolution <- full_data %>%
+  mutate(
+    DATE        = as.Date(DATE),
+    DATE_CLOSED = as.Date(`DATE CLOSED`),
+    period      = factor(
+      ifelse(DATE < as.Date("2024-01-01"), "Before NFSU", "After NFSU"),
+      levels = c("Before NFSU", "After NFSU")
+    ),
+    days_to_close = as.numeric(DATE_CLOSED - DATE)
+  ) %>%
+  filter(!is.na(days_to_close), days_to_close >= 0)
+```
+
+## Visualization 10.1 - Distribution of Resolution Time
+
+```{r}
+ggplot(resolution %>% filter(days_to_close <= 365),
+       aes(x = days_to_close, fill = period)) +
+  geom_histogram(binwidth = 14, position = "identity", alpha = 0.6, color = "white") +
+  scale_fill_manual(values = c("Before NFSU" = "red", "After NFSU" = "blue")) +
+  facet_wrap(~period) +
+  labs(
+    title    = "Case Resolution Time: Before vs After NFSU",
+    subtitle = "Days from incident date to date closed | Within 1 year",
+    x        = "Days to Close",
+    y        = "Count"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+## Visualization 10.2 - Median resolution time by disposition
+
+```{r}
+resolution_by_disp <- resolution %>%
+  filter(days_to_close <= 365) %>%
+  group_by(period, DISPOSITION) %>%
+  summarize(
+    median_days = median(days_to_close, na.rm = TRUE),
+    mean_days   = mean(days_to_close,   na.rm = TRUE),
+    n           = n(),
+    .groups     = "drop"
+  ) %>%
+  filter(n >= 5)  # drop very rare disposition categories
+
+ggplot(resolution_by_disp,
+       aes(x = reorder(DISPOSITION, median_days), y = median_days, fill = period)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Before NFSU" = "red", "After NFSU" = "blue")) +
+  coord_flip() +
+  labs(
+    title    = "Median Days to Close by Disposition: Before vs After NFSU",
+    subtitle = "Only dispositions with 5+ cases shown",
+    x        = "Disposition",
+    y        = "Median Days to Close",
+    fill     = "Period"
+  ) +
+  theme_minimal()
+```
+
+## Visualization 10.3 - Difference plot (After - Before median days)
+
+```{r}
+resolution_diff <- resolution_by_disp %>%
+  select(period, DISPOSITION, median_days) %>%
+  pivot_wider(names_from = period, values_from = median_days, values_fill = NA) %>%
+  filter(!is.na(`Before NFSU`), !is.na(`After NFSU`)) %>%
+  mutate(diff = `After NFSU` - `Before NFSU`)
+ggplot(resolution_diff, aes(x = reorder(DISPOSITION, diff), y = diff, fill = diff > 0)) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "blue")) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  labs(
+    title    = "Change in Median Days to Close by Disposition (After - Before NFSU)",
+    subtitle = "Red = took longer after NFSU | Blue = resolved faster after NFSU",
+    x        = "Disposition",
+    y        = "Change in Median Days"
+  ) +
+  theme_minimal()
+```
+
+## Summary stats table
+
+```{r}
+resolution_summary <- resolution %>%
+  filter(days_to_close <= 365) %>%
+  group_by(period) %>%
+  summarize(
+    n              = n(),
+    mean_days      = round(mean(days_to_close,   na.rm = TRUE), 1),
+    median_days    = round(median(days_to_close, na.rm = TRUE), 1),
+    pct_closed_7d  = round(100 * mean(days_to_close <= 7,   na.rm = TRUE), 1),
+    pct_closed_30d = round(100 * mean(days_to_close <= 30,  na.rm = TRUE), 1),
+    pct_closed_90d = round(100 * mean(days_to_close <= 90,  na.rm = TRUE), 1),
+    .groups        = "drop"
+  )
+
+kable(
+  resolution_summary,
+  col.names = c("Period", "n", "Mean Days", "Median Days",
+                "% Closed ≤7 Days", "% Closed ≤30 Days", "% Closed ≤90 Days"),
+  caption   = "Case Resolution Time Summary: Before vs After NFSU"
+)
+```
