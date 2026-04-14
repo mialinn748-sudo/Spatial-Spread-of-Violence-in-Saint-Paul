@@ -1,0 +1,555 @@
+---
+title: "St. Paul Shootings: Background Intensity Model"
+subtitle: "Poisson GLM for the Hawkes Process Background Rate μ(t)"
+author: "DASC 460 / STAT 460"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    number_sections: true
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+------------------------------------------------------------------------
+
+# Purpose and Context
+
+This file models the **background intensity function μ(t)** of a Hawkes
+(self-exciting) point process applied to non-fatal shooting incidents in
+St. Paul, MN (2022–2025).
+
+In a Hawkes process, the total conditional intensity (expected rate of
+events at time t) is:
+
+$$\lambda(t) = \underbrace{\mu(t)}_{\text{background rate}} + \underbrace{\sum_{t_i < t} g(t - t_i)}_{\text{self-excitation from past events}}$$
+
+**This file focuses entirely on estimating μ(t)** — the baseline
+shooting rate driven by measurable time-varying factors — before any
+self-excitation is modeled.
+
+We estimate μ(t) using a **Poisson generalized linear model (GLM)** with
+a log link, where the response is the daily count of shooting incidents
+and the predictors are time-based covariates identified from exploratory
+analysis and Dr. Clark's guidance.
+
+The key substantive question throughout: **Did the Non-Fatal Shooting
+Unit (NFSU), established January 1, 2024, produce a measurable reduction
+in shootings beyond the pre-existing trend?**
+
+------------------------------------------------------------------------
+
+# Setup: Libraries and Data
+
+```{r libraries}
+library(readxl)    # reading Excel data
+library(dplyr)     # data manipulation
+library(lubridate) # date/time handling
+library(ggplot2)   # visualization
+library(MASS)      # glm.nb() for negative binomial
+```
+
+```{r load-data}
+# Load the shooting incident data (one row per incident)
+shootings_raw <- read_excel("Shootings_Full Data(new).xlsx", sheet = "Full Data") %>%
+  mutate(DATE = as.Date(DATE))
+
+cat("Total shooting incidents in dataset:", nrow(shootings_raw), "\n")
+cat("Date range:", as.character(min(shootings_raw$DATE)),
+    "to", as.character(max(shootings_raw$DATE)), "\n")
+```
+
+------------------------------------------------------------------------
+
+# Building the Daily Count Panel
+
+## Why a complete daily panel?
+
+The raw data only contains rows for days when shootings occurred. For
+Poisson regression, we need **every day in the study window** —
+including days with zero incidents — so the model correctly accounts for
+the exposure time when incidents did *not* occur.
+
+Without zero-count days, the model would be estimated only on "active"
+days and would systematically overestimate the background rate.
+
+```{r build-panel}
+# Step 1: Create a row for every calendar day in the study window
+all_study_days <- data.frame(
+  DATE = seq(min(shootings_raw$DATE), max(shootings_raw$DATE), by = "day")
+)
+
+# Step 2: Count incidents per day from raw data
+daily_incident_counts <- shootings_raw %>%
+  group_by(DATE) %>%
+  summarise(shooting_count = n(), .groups = "drop")
+
+# Step 3: Join counts onto the full day sequence; zero-fill missing days
+daily_data <- all_study_days %>%
+  left_join(daily_incident_counts, by = "DATE") %>%
+  mutate(shooting_count = replace(shooting_count, is.na(shooting_count), 0)) %>%
+  arrange(DATE)
+
+cat("Complete daily panel:\n")
+cat("  Total days in panel:", nrow(daily_data), "\n")
+cat("  Days with zero incidents:", sum(daily_data$shooting_count == 0), "\n")
+cat("  Days with 1+ incidents:", sum(daily_data$shooting_count > 0), "\n")
+cat("  Max incidents in a single day:", max(daily_data$shooting_count), "\n")
+```
+
+------------------------------------------------------------------------
+
+# Covariate Engineering
+
+Each covariate below was motivated by either exploratory analysis
+(visualizations showed clear patterns) or Dr. Clark's model
+specification from meetings.
+
+```{r covariates}
+# Small constant to allow safe log-transformation of zero-count lag values
+LOG_ZERO_EPSILON <- 1e-6
+
+daily_data <- daily_data %>%
+  mutate(
+
+    # ── TREND ──────────────────────────────────────────────────────────────────
+    # How it was found: Monthly count plots showed a clear downward trend in
+    # shootings from 2022 through 2025. Dr. Clark explicitly specified a linear
+    # time trend as a required covariate (Stat meet 3).
+    # Construction: Integer index starting at 0 on the first day of the study.
+    # In the Poisson model: captures the average day-over-day change in the
+    # log-expected shooting rate, independent of all other factors.
+    time_trend = as.numeric(DATE - min(DATE)),
+
+    # ── NFSU INDICATOR ─────────────────────────────────────────────────────────
+    # How it was found: The Non-Fatal Shooting Unit became operational on
+    # January 1, 2024 (confirmed in the police department visit). This is the
+    # primary intervention variable of interest for the project.
+    # Construction: Binary 0/1 — 0 before NFSU, 1 on or after Jan 1, 2024.
+    # In the model: estimates the level shift in log-expected rate associated
+    # with the unit's establishment, after controlling for trend and timing.
+    nfsu_active = ifelse(DATE >= as.Date("2024-01-01"), 1, 0),
+
+    # ── WEEKEND INDICATOR ──────────────────────────────────────────────────────
+    # How it was found: Day-of-week bar charts and day×hour heatmaps showed
+    # consistently higher shooting counts on Saturdays and Sundays across all
+    # years. Dr. Clark included this in the baseline model specification.
+    # Construction: Binary 1 = Saturday or Sunday, 0 = weekday.
+    # In the model: captures the systematic weekly rhythmicity in shooting risk.
+    is_weekend = ifelse(wday(DATE) %in% c(1, 7), 1, 0),
+
+    # ── SEASON ─────────────────────────────────────────────────────────────────
+    # How it was found: Monthly and seasonal bar charts showed a pronounced
+    # winter dip in shootings, consistent with the literature on seasonal
+    # crime patterns. Spring and summer were elevated but less distinctly so.
+    # Construction: Four meteorological seasons based on calendar month.
+    # Fall is the reference category in the model.
+    # In the model: captures systematic seasonal variation in the background rate.
+    season = case_when(
+      month(DATE) %in% c(12, 1, 2) ~ "Winter",
+      month(DATE) %in% c(3, 4, 5)  ~ "Spring",
+      month(DATE) %in% c(6, 7, 8)  ~ "Summer",
+      TRUE                          ~ "Fall"          # reference level
+    ),
+
+    # ── INTERACTION: WEEKEND × NFSU ────────────────────────────────────────────
+    # How it was found: Dr. Clark's baseline model specification included this
+    # term to test whether the NFSU changed the *weekend effect*, not just the
+    # overall level. Theoretically, if the unit altered patrol patterns on
+    # weekends specifically, β_weekend:nfsu would be non-zero.
+    # (Computed implicitly by including weekend:nfsu in the glm() formula)
+
+    # ── LAGGED COUNT (self-excitation proxy) ───────────────────────────────────
+    # How it was found: Dr. Clark introduced this at DASC meet 4 as a discrete
+    # approximation to the Hawkes self-excitation term. The idea: if yesterday
+    # had many shootings, today's expected count may be elevated (repeat
+    # victimization / retaliation dynamics). The lag is logged so it enters
+    # the log-linear model on the right scale. A small epsilon is added before
+    # logging to handle zero-count days without producing -Inf.
+    # Construction: Previous day's shooting count, log-transformed.
+    lag_shooting_count     = lag(shooting_count, n = 1, default = 0),
+    log_lag_shooting_count = log(lag_shooting_count + LOG_ZERO_EPSILON)
+  )
+
+cat("Covariate summary:\n")
+cat("  Trend range: 0 to", max(daily_data$time_trend), "(days)\n")
+cat("  NFSU active days:", sum(daily_data$nfsu_active), "\n")
+cat("  Weekend days:", sum(daily_data$is_weekend), "\n")
+cat("  Season distribution:\n")
+print(table(daily_data$season))
+```
+
+------------------------------------------------------------------------
+
+# Model Fitting
+
+We fit four nested Poisson GLMs to build from Clark's baseline to our
+best model, plus a robustness check using a negative binomial
+distribution.
+
+All models use a **log link**, so coefficients are interpreted as
+additive effects on log(μ) — equivalently, multiplicative effects on μ
+itself after exponentiation.
+
+The model family:
+$$Y_t \sim \text{Poisson}(\mu_t), \quad \log(\mu_t) = \mathbf{X}_t \boldsymbol{\beta}$$
+
+```{r fit-models}
+# ── M0: Clark's exact baseline specification (Stat meet 3 whiteboard) ──────────
+# log(μ_t) = β₀ + β₁·trend + β₂·weekend + β₃·nfsu + β₄·(weekend × nfsu)
+m0_baseline <- glm(
+  shooting_count ~ time_trend + is_weekend + nfsu_active + is_weekend:nfsu_active,
+  family = poisson(link = "log"),
+  data   = daily_data
+)
+
+# ── M1: Add season (motivated by exploratory visualizations) ──────────────────
+# log(μ_t) = β₀ + β₁·trend + β₂·weekend + β₃·nfsu + β₄·(weekend×nfsu) + β_season
+m1_with_season <- glm(
+  shooting_count ~ time_trend + is_weekend + nfsu_active + is_weekend:nfsu_active
+                 + factor(season),
+  family = poisson(link = "log"),
+  data   = daily_data
+)
+
+# ── M2: Add logged lag (discrete self-excitation proxy, DASC meet 4) ──────────
+# log(μ_t) = [M1 terms] + β·log(y_{t-1} + ε)
+m2_with_lag <- glm(
+  shooting_count ~ time_trend + is_weekend + nfsu_active + is_weekend:nfsu_active
+                 + factor(season) + log_lag_shooting_count,
+  family = poisson(link = "log"),
+  data   = daily_data
+)
+
+# ── M3: Drop trend — LRT test requested by Dr. Clark (DASC meet 4) ────────────
+# Tests whether trend is necessary once season and lag are included
+m3_no_trend <- glm(
+  shooting_count ~ is_weekend + nfsu_active + is_weekend:nfsu_active
+                 + factor(season) + log_lag_shooting_count,
+  family = poisson(link = "log"),
+  data   = daily_data
+)
+
+# ── M1-NB: Negative Binomial robustness check for mild overdispersion ─────────
+# Dispersion ~1.28 in M1 suggests mild overdispersion; NB adds a free
+# dispersion parameter θ to account for this
+m1_negbin <- glm.nb(
+  shooting_count ~ time_trend + is_weekend + nfsu_active + is_weekend:nfsu_active
+                 + factor(season),
+  data = daily_data
+)
+
+cat("All models fitted successfully.\n")
+```
+
+------------------------------------------------------------------------
+
+# Model Comparison
+
+## AIC / BIC
+
+Lower AIC and BIC indicate better model fit, penalized for model
+complexity.
+
+```{r model-comparison-aic}
+aic_table <- AIC(m0_baseline, m1_with_season, m2_with_lag, m3_no_trend)
+bic_table <- BIC(m0_baseline, m1_with_season, m2_with_lag, m3_no_trend)
+
+comparison_table <- data.frame(
+  Model       = c("M0: Baseline (trend+weekend+nfsu)",
+                  "M1: + Season",
+                  "M2: + Season + Log Lag",
+                  "M3: No Trend (+ Season + Log Lag)"),
+  df          = aic_table$df,
+  AIC         = round(aic_table$AIC, 1),
+  BIC         = round(bic_table$BIC, 1)
+)
+
+knitr::kable(comparison_table, caption = "Model Comparison: AIC and BIC")
+```
+
+## Likelihood Ratio Tests
+
+LRT tests whether each added term significantly improves fit.
+
+```{r lrt-tests}
+cat("=== LRT: M0 → M1  (Does adding season help?) ===\n")
+print(anova(m0_baseline, m1_with_season, test = "Chisq"))
+
+cat("\n=== LRT: M1 → M2  (Does the lag term add anything?) ===\n")
+print(anova(m1_with_season, m2_with_lag, test = "Chisq"))
+
+cat("\n=== LRT: M3 → M2  (Is trend necessary?) ===\n")
+print(anova(m3_no_trend, m2_with_lag, test = "Chisq"))
+```
+
+**Interpretation:**
+
+-   Season significantly improves fit over M0 (p \< 0.001) — include it.
+-   The logged lag does **not** significantly improve fit over M1 (p ≈
+    0.27) — at daily granularity, yesterday's count adds little once
+    trend and season are controlled for.
+-   Trend is highly significant (p \< 2e-16) — cannot be dropped.
+
+**→ M1 is the best model by AIC, BIC, and LRT.**
+
+## Dispersion Check
+
+```{r dispersion}
+pearson_dispersion <- function(model) {
+  sum(residuals(model, type = "pearson")^2) / model$df.residual
+}
+
+disp_table <- data.frame(
+  Model      = c("M0", "M1", "M2", "M1-NB"),
+  Dispersion = round(c(pearson_dispersion(m0_baseline),
+                       pearson_dispersion(m1_with_season),
+                       pearson_dispersion(m2_with_lag),
+                       pearson_dispersion(m1_negbin)), 3),
+  Note = c("Mild overdispersion",
+            "Mild overdispersion",
+            "Mild overdispersion",
+            "Free dispersion parameter θ")
+)
+knitr::kable(disp_table,
+             caption = "Pearson Dispersion Statistic (ideal ≈ 1.0)")
+```
+
+Dispersion \~1.28 in the Poisson models indicates mild overdispersion.
+The Negative Binomial (M1-NB) addresses this and provides a useful
+robustness check.
+
+------------------------------------------------------------------------
+
+# Results: Best Model (M1)
+
+## Coefficient Table
+
+```{r m1-summary}
+summary(m1_with_season)
+```
+
+## Exponentiated Coefficients (Incidence Rate Ratios)
+
+Exponentiating the log-scale coefficients gives **Incidence Rate Ratios
+(IRRs)**: values \> 1 increase expected shootings, values \< 1 decrease
+them, relative to baseline.
+
+```{r irr-table}
+irr_estimates <- exp(coef(m1_with_season))
+irr_ci        <- exp(confint(m1_with_season))
+
+irr_table <- round(cbind(IRR = irr_estimates, irr_ci), 3)
+rownames(irr_table) <- c("Intercept (Fall, weekday, pre-NFSU, trend=0)",
+                          "Time Trend (per day)",
+                          "Weekend vs Weekday",
+                          "NFSU Active vs Inactive",
+                          "Spring vs Fall",
+                          "Summer vs Fall",
+                          "Winter vs Fall",
+                          "Weekend × NFSU Interaction")
+
+knitr::kable(irr_table,
+             col.names = c("IRR", "95% CI Lower", "95% CI Upper"),
+             caption   = "M1 Incidence Rate Ratios (exponentiated coefficients)")
+```
+
+## Negative Binomial Robustness Check
+
+Coefficients should be essentially identical to M1-Poisson if the
+Poisson specification is appropriate. Differences in significance
+indicate sensitivity to the overdispersion assumption.
+
+```{r nb-summary}
+cat("Poisson M1 AIC:", round(AIC(m1_with_season), 1), "\n")
+cat("NegBin  M1 AIC:", round(AIC(m1_negbin), 1), "\n\n")
+summary(m1_negbin)
+```
+
+------------------------------------------------------------------------
+
+# Diagnostics
+
+## Deviance Residuals Over Time
+
+Residuals should appear as random noise around zero with no systematic
+patterns. Persistent structure (trends, seasonal bulges, etc.) would
+indicate missing covariates.
+
+```{r residuals-over-time, fig.width=11, fig.height=4}
+plot_residuals_over_time <- function(model, model_label) {
+  daily_data %>%
+    mutate(deviance_residual = residuals(model, type = "deviance")) %>%
+    ggplot(aes(x = DATE, y = deviance_residual)) +
+    geom_line(alpha = 0.45, linewidth = 0.35) +
+    geom_hline(yintercept = 0, color = "red", linetype = "dashed", linewidth = 0.7) +
+    geom_vline(xintercept = as.Date("2024-01-01"),
+               color = "steelblue", linetype = "dotted", linewidth = 0.7) +
+    annotate("text", x = as.Date("2024-02-01"), y = 4.2,
+             label = "NFSU Start", color = "steelblue", hjust = 0, size = 3) +
+    labs(title = paste(model_label, "— Deviance Residuals Over Time"),
+         subtitle = "No systematic pattern = model captures main temporal structure",
+         x = "Date", y = "Deviance Residual") +
+    theme_minimal()
+}
+
+plot_residuals_over_time(m0_baseline,    "M0 (Baseline)")
+plot_residuals_over_time(m1_with_season, "M1 (Best Model)")
+```
+
+## ACF and PACF of Deviance Residuals
+
+If the model has captured all temporal structure, residuals should be
+uncorrelated across time lags — ACF and PACF bars should fall within the
+blue confidence bands. Significant spikes would indicate remaining
+autocorrelation that the model misses.
+
+```{r acf-pacf, fig.width=11, fig.height=4}
+plot_acf_pacf <- function(model, model_label) {
+  res <- residuals(model, type = "deviance")
+  par(mfrow = c(1, 2))
+  acf(res,  main = paste(model_label, "— ACF"),  lag.max = 30)
+  pacf(res, main = paste(model_label, "— PACF"), lag.max = 30)
+  par(mfrow = c(1, 1))
+}
+
+plot_acf_pacf(m0_baseline,    "M0 (Baseline)")
+plot_acf_pacf(m1_with_season, "M1 (Best Model)")
+```
+
+**ACF/PACF interpretation:** Lags are mostly within bounds for both M0
+and M1. The PACF shows a few small spikes (max \~0.08) but these are
+near the significance threshold and lack a systematic pattern. The model
+captures the main temporal structure adequately for a background
+intensity estimator.
+
+------------------------------------------------------------------------
+
+# Fitted Values vs Observed Counts
+
+```{r fitted-vs-observed, fig.width=12, fig.height=5}
+daily_data %>%
+  mutate(
+    fitted_m0 = fitted(m0_baseline),
+    fitted_m1 = fitted(m1_with_season)
+  ) %>%
+  ggplot(aes(x = DATE)) +
+  geom_point(aes(y = shooting_count), alpha = 0.2, size = 0.8, color = "grey40") +
+  geom_line(aes(y = fitted_m1, color = "M1 (Best)"), linewidth = 0.8) +
+  geom_vline(xintercept = as.Date("2024-01-01"),
+             linetype = "dashed", color = "steelblue", linewidth = 0.7) +
+  annotate("text", x = as.Date("2024-02-01"),
+           y = max(daily_data$shooting_count) * 0.88,
+           label = "NFSU Start (Jan 1, 2024)",
+           color = "steelblue", hjust = 0, size = 3) +
+  scale_color_manual(values = c("M1 (Best)" = "red")) +
+  labs(title = "M1 Best Model: Observed Daily Shooting Counts vs Fitted Background Rate",
+       subtitle = paste("The red line is μ̂(t) — the estimated Poisson background rate.",
+                        "The sawtooth pattern reflects the weekend effect riding on a downward trend."),
+       x = "Date", y = "Daily Shooting Count",
+       color = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+The fitted line (μ̂) oscillates between weekday and weekend predicted
+rates on top of the long-run downward trend. Extreme event days (counts
+well above the line) are the "spikes" that a Hawkes self-excitation term
+would be tasked with explaining.
+
+------------------------------------------------------------------------
+
+# Summary of Findings
+
+```{r findings-table}
+findings <- data.frame(
+  Covariate = c(
+    "Time Trend",
+    "Weekend (Sat/Sun vs weekday)",
+    "NFSU Active (vs pre-NFSU)",
+    "Winter (vs Fall)",
+    "Spring (vs Fall)",
+    "Summer (vs Fall)",
+    "Weekend × NFSU Interaction",
+    "Logged Prior-Day Count (lag)"
+  ),
+  IRR = c("0.999", "1.31", "1.01", "0.73", "0.97", "1.02", "0.93", "—"),
+  `95% CI` = c("(0.999, 0.999)", "(1.20, 1.44)", "(0.85, 1.19)",
+                "(0.65, 0.82)",  "(0.87, 1.08)", "(0.92, 1.14)",
+                "(0.78, 1.10)",  "—"),
+  Significant = c("Yes (p < 2e-16)", "Yes (p < 0.001)", "No (p = 0.947)",
+                   "Yes (p < 0.001)", "No (p = 0.607)", "No (p = 0.678)",
+                   "No (p = 0.379)", "No (p = 0.27, LRT)"),
+  Interpretation = c(
+    "Shootings declining ~0.13%/day over study period",
+    "~31% more shootings on weekends",
+    "No significant level change after NFSU launch",
+    "~27% fewer shootings in winter",
+    "Not distinguishable from fall",
+    "Not distinguishable from fall",
+    "Weekend pattern unchanged post-NFSU",
+    "Adds nothing once trend + season included"
+  )
+)
+
+knitr::kable(findings,
+             col.names = c("Covariate", "IRR", "95% CI",
+                            "Significant?", "Plain-English Interpretation"),
+             caption = "M1 (Best Model) — Complete Results Summary")
+```
+
+------------------------------------------------------------------------
+
+# Conclusions and Next Steps
+
+## Key Takeaways
+
+**1. Strong downward trend (p \< 2e-16):** Shootings declined
+consistently throughout the study period. This pre-existing trend
+explains most of the reduction visible after January 2024.
+
+**2. Weekend effect (IRR = 1.31, p \< 0.001):** About 31% more shootings
+on Saturdays and Sundays, a pattern that remained stable before and
+after the NFSU.
+
+**3. Winter dip (IRR = 0.73, p \< 0.001):** Roughly 27% fewer shootings
+in winter months. No other season differs significantly from fall once
+trend is controlled.
+
+**4. NFSU effect is not statistically significant (p = 0.947):** After
+controlling for the pre-existing downward trend, the data cannot
+distinguish the NFSU's contribution from trend continuation. This does
+not mean the unit had no effect — it means the observational design
+cannot isolate it from the background trend.
+
+**5. No evidence of daily temporal clustering at this scale:** The
+logged lag term (discrete self-excitation proxy) does not significantly
+improve fit over M1, and the ACF/PACF of residuals are largely clean. If
+Hawkes self-excitation is present, it likely operates at finer time
+scales (hours) than daily bins can capture.
+
+## What This Means for the Hawkes Model
+
+**M1 is the estimated background intensity μ(t):**
+
+$$\log\hat{\mu}(t) = 1.473 - 0.00127 \cdot \text{trend}_t + 0.273 \cdot \text{weekend}_t - 0.312 \cdot \mathbf{1}[\text{Winter}]$$
+
+This function serves as the Poisson baseline into which the
+self-excitation triggering kernel g(t − tᵢ) will be added in the full
+Hawkes model. The clean ACF/PACF at the daily level is consistent with
+the interpretation that self-excitation, if present, operates at
+sub-daily resolution — which the continuous-time Hawkes process (rather
+than this discretized GLM) is designed to capture.
+
+**Next step:** Fit the spatio-temporal Hawkes process using the
+`spatstat` or custom MLE approach, with μ(t) parameterized by these
+covariate estimates as a fixed or estimated offset. \`\`\`
