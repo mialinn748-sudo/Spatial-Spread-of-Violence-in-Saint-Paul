@@ -1,0 +1,293 @@
+---
+title: "cleanmodel"
+format: html
+editor: visual
+---
+
+## 
+
+```{r warning=FALSE, message=FALSE}
+library(rmarkdown); library(knitr); library(igraph); library(corrplot); library(moments); library(readxl); library(dplyr); library(ggplot2); library(lubridate); library(leaflet); library(readr); library(leaflet.extras2); library(sf); library(janitor); library(broom);library(MASS);library(spdep)
+
+```
+
+**Aggregate weekly**
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(readxl)
+
+# Step 1 — load data
+shootings <- read_excel("Shootings_Full Data(new).xlsx", sheet = "Full Data")
+
+# Step 2 — create individual-level variables
+data_full <- shootings %>%
+  arrange(DATE, Time) %>%
+  mutate(
+    DATE   = as.Date(DATE),
+    month  = month(DATE),
+    season = case_when(
+      month %in% c(12, 1, 2) ~ "winter",
+      month %in% c(3, 4, 5)  ~ "spring",
+      month %in% c(6, 7, 8)  ~ "summer",
+      TRUE                   ~ "fall"
+    ),
+    unit = ifelse(DATE >= as.Date("2024-01-01"), 1, 0),
+    # ISO week label for grouping
+    week_start = floor_date(DATE, unit = "week", week_start = 1)  # weeks start Monday
+  )
+
+# Step 3 — aggregate to weekly
+weekly_data <- data_full %>%
+  group_by(week_start) %>%
+  summarise(
+    y      = n(),                                         # total shootings that week
+    unit   = max(unit),    # 1 if the unit was active at any point that week
+    season = names(which.max(table(season))),             # majority season
+    .groups = "drop"
+  ) %>%
+  arrange(week_start) %>%
+  mutate(
+    trend     = as.integer(week_start - min(week_start)) %/% 7L,  # week index: 0, 1, 2, ...
+    lag_y     = lag(y, default = 0),
+    lag_y_log = log(lag_y + 1)
+  )
+
+# Step 4 — fit Poisson model
+weekly_model <- glm(
+  y ~ trend + unit + factor(season) + lag_y_log,
+  family = poisson(link = "log"),
+  data   = weekly_data
+)
+
+# Step 5 — results
+summary(weekly_model)
+exp(coef(weekly_model))          # IRRs
+AIC(weekly_model)
+```
+
+**Plots for weekly** **Model**
+
+```{r}
+
+```
+
+**Reading Spacial Data**
+
+```{r}
+library(tidyverse)
+library(sf)
+
+unzip("StPaul_Police_Gri_LayerToKML.kmz", exdir = tempdir())
+kml_path <- list.files(tempdir(), pattern = "\\.kml$", full.names = TRUE)
+spatial_data <- st_read(kml_path)
+
+
+
+
+# Check what you got
+print(spatial_data)
+st_crs(spatial_data)        # coordinate reference system
+plot(st_geometry(spatial_data))  # quick visual check
+
+```
+
+**Joining Data**
+
+```{r}
+
+grid_counts <- data_full %>%
+  group_by(GRID) %>%
+  summarise(y = n(), .groups = "drop") %>%
+  mutate(GRID = as.character(GRID))      # convert to match spatial_data$Name
+
+grid_sf <- spatial_data %>%
+  left_join(grid_counts, by = c("Name" = "GRID")) %>%
+  m
+utate(y = replace_na(y, 0))
+```
+
+**Space Model(only)**
+
+```{r}
+spatial_only_model <- glm(
+  y ~ 1,                          # intercept only, spatial structure captured by weights
+  family = poisson(link = "log"),
+  data = grid_sf
+)
+
+grid_sf$residuals <- residuals(spatial_only_model, type = "pearson")
+```
+
+**Spatial Matrix**
+
+```{r}
+
+
+neighbors <- poly2nb(grid_sf, queen = TRUE)
+weights   <- nb2listw(neighbors, style = "W", zero.policy = TRUE)
+```
+
+**Morans - I**
+
+```{r}
+moran_test <- moran.test(grid_sf$residuals, weights, zero.policy = TRUE)
+print(moran_test)
+```
+
+**LISAS**
+
+```{r}
+lisa <- localmoran(grid_sf$residuals, weights, zero.policy = TRUE)
+
+grid_sf <- grid_sf %>%
+  mutate(
+    lisa_I   = lisa[, 1],
+    lisa_p   = lisa[, 5],
+    lisa_sig = lisa_p < 0.05
+  )
+
+plot(grid_sf["lisa_I"], main = "LISA - Local Moran's I")
+```
+
+**Lisas with numbers on hot spots(whole data)**
+
+```{r}
+# Get centroids for label placement
+grid_sf <- grid_sf %>%
+  mutate(
+    centroid_x = st_coordinates(st_centroid(geometry))[, 1],
+    centroid_y = st_coordinates(st_centroid(geometry))[, 2]
+  )
+
+# Plot with grid numbers
+ggplot(grid_sf) +
+  geom_sf(aes(fill = lisa_I)) +
+  geom_text(data = filter(grid_sf, lisa_sig == TRUE),
+            aes(x = centroid_x, y = centroid_y, label = Name),
+            size = 2.5, color = "black") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       midpoint = 0, name = "Local Moran's I") +
+  labs(title = "LISA - Local Moran's I by Police Grid",
+       subtitle = "Labels shown only for significant clusters (p < 0.05)") +
+  theme_minimal()
+```
+
+**Before and After Spitting data**
+
+```{r}
+# Split data into before and after
+before_sf <- data_full %>%
+  filter(DATE < as.Date("2024-01-01")) %>%
+  group_by(GRID) %>%
+  summarise(y = n(), .groups = "drop") %>%
+  mutate(GRID = as.character(GRID))
+
+after_sf <- data_full %>%
+  filter(DATE >= as.Date("2024-01-01")) %>%
+  group_by(GRID) %>%
+  summarise(y = n(), .groups = "drop") %>%
+  mutate(GRID = as.character(GRID))
+
+# Join both to spatial grid
+grid_before <- spatial_data %>%
+  left_join(before_sf, by = c("Name" = "GRID")) %>%
+  mutate(y = replace_na(y, 0))
+
+grid_after <- spatial_data %>%
+  left_join(after_sf, by = c("Name" = "GRID")) %>%
+  mutate(y = replace_na(y, 0))
+```
+
+**Poisons residual** **and Morans I** **before and after**
+
+```{r}
+# Poisson residuals for each period
+grid_before$residuals <- residuals(
+  glm(y ~ 1, family = poisson(link = "log"), data = grid_before), 
+  type = "pearson"
+)
+
+grid_after$residuals <- residuals(
+  glm(y ~ 1, family = poisson(link = "log"), data = grid_after), 
+  type = "pearson"
+)
+
+# Weights matrix (same for both since grid geometry doesn't change)
+neighbors <- poly2nb(grid_before, queen = TRUE)
+weights   <- nb2listw(neighbors, style = "W", zero.policy = TRUE)
+
+# Moran's I for each period
+cat("--- BEFORE ---\n")
+print(moran.test(grid_before$residuals, weights, zero.policy = TRUE))
+
+cat("--- AFTER ---\n")
+print(moran.test(grid_after$residuals, weights, zero.policy = TRUE))
+```
+
+**LISAS before and after**
+
+```{r}
+# LISA for each period
+lisa_before <- localmoran(grid_before$residuals, weights, zero.policy = TRUE)
+lisa_after  <- localmoran(grid_after$residuals,  weights, zero.policy = TRUE)
+
+grid_before <- grid_before %>%
+  mutate(
+    lisa_I   = lisa_before[, 1],
+    lisa_p   = lisa_before[, 5],
+    lisa_sig = lisa_p < 0.05,
+    centroid_x = st_coordinates(st_centroid(geometry))[, 1],
+    centroid_y = st_coordinates(st_centroid(geometry))[, 2]
+  )
+
+grid_after <- grid_after %>%
+  mutate(
+    lisa_I   = lisa_after[, 1],
+    lisa_p   = lisa_after[, 5],
+    lisa_sig = lisa_p < 0.05,
+    centroid_x = st_coordinates(st_centroid(geometry))[, 1],
+    centroid_y = st_coordinates(st_centroid(geometry))[, 2]
+  )
+
+# Plot side by side
+library(ggplot2)
+library(patchwork)
+
+p1 <- ggplot(grid_before) +
+  geom_sf(aes(fill = lisa_I)) +
+  geom_text(data = filter(grid_before, lisa_sig == TRUE),
+            aes(x = centroid_x, y = centroid_y, label = Name),
+            size = 2.5, color = "black") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       midpoint = 0, name = "Local Moran's I",
+                       limits = c(-3, 3)) +   # same scale for fair comparison
+  labs(title = "Before Unit (pre Jan 2024)") +
+  theme_minimal()
+
+p2 <- ggplot(grid_after) +
+  geom_sf(aes(fill = lisa_I)) +
+  geom_text(data = filter(grid_after, lisa_sig == TRUE),
+            aes(x = centroid_x, y = centroid_y, label = Name),
+            size = 2.5, color = "black") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       midpoint = 0, name = "Local Moran's I",
+                       limits = c(-3, 3)) +   # same scale for fair comparison
+  labs(title = "After Unit (Jan 2024 onward)") +
+  theme_minimal()
+
+p1 + p2 + plot_layout(guides = "collect")
+
+#The dark gray/black grids (87, 88, 89) before are extremely high LISA values that appear to cool slightly after — the intensity of the hot spot looks a bit more distributed rather than concentrated in those exact cells
+#More grids are labeled after (31, 32, 33, 91, 114, 145, 163-167, 183-186, 206) — suggesting that after deployment, significant spatial clustering actually became detectable in more areas, possibly indicating some displacement of violence outward
+#The southern grids (163-186 area) show up as labeled significant clusters only in the after map — this is worth paying attention to as a potential displacement signal
+```
+
+```{r}
+library(surveillance)
+
+fit <- hhh4(sts_object, control = list(  ar = list(f = ~ 1),  end = list(f = ~ x1 + x2 + offset(log(population))) ))
+```
+
+d
