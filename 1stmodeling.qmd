@@ -1,0 +1,182 @@
+---
+title: "Capstone"
+format: html
+editor: visual
+---
+
+```{r}
+library(tidyverse)
+install.packages("janitor")
+```
+
+```{r}
+install.packages("readxl")
+```
+
+```{r}
+library(readxl)
+data <- read_excel(file.choose(), sheet = "Full Data")
+colnames(data)
+
+
+```
+
+```{r}
+head(data)
+colnames(data)
+```
+
+Step 2, fixing the cloumn names
+
+```{r}
+colnames(data)
+
+```
+
+```{r}
+library(janitor)
+
+data <- data %>%
+  clean_names()
+```
+
+```{r}
+data$date <- as.Date(data$date)
+```
+
+```{r}
+library(lubridate)
+
+data_clean <- data %>%
+  mutate(date = as.Date(date)) %>%
+  group_by(date, grid) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  mutate(
+    weekend = if_else(wday(date) %in% c(1, 7), 1, 0),
+    unit = if_else(date >= as.Date("2024-01-01"), 1, 0)
+  )
+```
+
+```{r}
+head(data_clean)
+```
+
+```{r}
+poisson_mod <- glm(
+  count ~ factor(grid) + weekend + unit + weekend:unit,
+  family = poisson(link = "log"),
+  data = data_clean
+)
+```
+
+```{r}
+summary(poisson_mod)
+```
+
+```{r}
+exp(coef(poisson_mod))
+```
+
+```{r}
+plot(residuals(poisson_mod, type = "pearson"))
+abline(h = 0, lty = 2)
+```
+
+```{r}
+mean(data_clean$count)
+var(data_clean$count)
+
+```
+
+I grouped the data by date and grid to count the number of crimes happening in each location on each day. I then used a poisson regression to see if the weekend, location or intervention affected the counts.
+
+However, the dataset only included cases where crimes occured. Most of the count equaled to 1 with very few 2 and just one 3. There were no zero cvalues. This shows that the data only includes the cases where crimes occured and doesnt capture the location date combo with no crimes. That is the reason why it has a very limited variability, making it very difficult for the model to detect meningful patterns.
+
+```{r}
+table(data_clean$count)
+
+```
+
+```{r}
+full_data <- expand.grid(
+  date = seq(min(data$date), max(data$date), by = "day"),
+  grid = unique(data$grid)
+)
+counts <- data %>%
+  group_by(date, grid) %>%
+  summarise(count = n(), .groups = "drop")
+
+data_full <- full_data %>%
+  left_join(counts, by = c("date", "grid")) %>%
+  mutate(count = ifelse(is.na(count), 0, count))
+
+data_full <- data_full %>%
+  mutate(
+    weekend = if_else(wday(date) %in% c(1,7), 1, 0),
+    unit = if_else(date >= as.Date("2024-01-01"), 1, 0),
+    trend = as.numeric(date - min(date))
+  )
+
+```
+
+```{r}
+data_full <- data_full %>%
+  arrange(grid, date) %>%
+  group_by(grid) %>%
+  mutate(lag_count = lag(count, 1)) %>%
+  ungroup() %>%
+  mutate(log_lag = log(ifelse(is.na(lag_count), 0, lag_count) + 1))
+
+model1 <- glm(count ~ trend + unit + weekend,
+              family = poisson(),
+              data = data_full)
+
+model2 <- glm(count ~ trend + unit + weekend + log_lag,
+              family = poisson(),
+              data = data_full)
+
+summary(model1)
+summary(model2)
+```
+
+```{r}
+data_full <- data_full %>%
+  mutate(month = factor(format(date, "%m")))
+```
+
+```{r}
+model3 <- glm(count ~ trend + unit + weekend + log_lag + month,
+              family = poisson(),
+              data = data_full)
+
+summary(model3)
+```
+
+```{r}
+AIC(model1, model2, model3)
+```
+
+```{r}
+mean(data_full$count)
+var(data_full$count)
+
+summary(model3)$deviance / summary(model3)$df.residual
+```
+
+```{r}
+res <- residuals(model3, type = "deviance")
+
+acf(res)
+pacf(res)
+```
+
+```{r}
+anova(model2, model3, test = "Chisq")
+```
+
+```{r}
+summary(model3)
+AIC(model1, model2, model3)
+```
+
+There is no statistical evidence that the non-fatal shooting unit implemented in 2024 reduced shooting counts after controlling for time trend, seasonality, weekend effects, and lag dependence.
