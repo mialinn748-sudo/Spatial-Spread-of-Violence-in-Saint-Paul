@@ -1,0 +1,718 @@
+---
+title: "DASC 460: Spatial Analysis of Non-Fatal Shootings in Saint Paul — Grid-Level Modeling"
+subtitle: "Incorporating Spatial Structure, Moran's I, LISA Hotspot Detection, and Weekly Poisson Regression"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+---
+
+------------------------------------------------------------------------
+
+# Setup
+
+## Load Libraries
+
+```{r warning=FALSE, message=FALSE}
+library(rmarkdown)
+library(knitr)
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(leaflet)
+library(tidyr)
+library(sf)
+library(xml2)       # parse KML directly
+library(spdep)      # Moran's I, LISA, spatial weights
+library(MASS)       # negative binomial
+library(lmtest)     # likelihood ratio test
+library(AER)        # dispersion test
+```
+
+------------------------------------------------------------------------
+
+# Section 1: Load and Prepare Data
+
+## 1.1 Load Shooting Data
+
+```{r}
+file <- "Shootings_Full Data(new).xlsx"
+
+full_data <- read_excel(file, sheet = "Full Data") %>%
+  mutate(
+    DATE       = as.Date(DATE),
+    period     = if_else(DATE < as.Date("2024-01-01"), "Before NFSU", "After NFSU"),
+    period     = factor(period, levels = c("Before NFSU", "After NFSU")),
+    season     = case_when(
+      month(DATE) %in% c(12, 1, 2)  ~ "Winter",
+      month(DATE) %in% c(3, 4, 5)   ~ "Spring",
+      month(DATE) %in% c(6, 7, 8)   ~ "Summer",
+      month(DATE) %in% c(9, 10, 11) ~ "Fall"
+    ),
+    season     = factor(season, levels = c("Winter", "Spring", "Summer", "Fall")),
+    week       = floor_date(DATE, "week", week_start = 1),
+    week_index = as.integer(difftime(week, min(week, na.rm = TRUE), units = "weeks")),
+    nfsu       = as.integer(DATE >= as.Date("2024-01-01")),
+    GRID       = as.character(GRID)
+  ) %>%
+  filter(!is.na(Lat), !is.na(Long), !is.na(DATE), Lat != 0, Long != 0)
+
+cat("Shooting records loaded:", nrow(full_data), "\n")
+```
+
+## 1.2 Load Police Grid from KMZ
+
+We parse the KML directly using `xml2` to avoid geometry type issues that occur when `sf` reads KML MultiGeometry features.
+
+```{r message=FALSE, warning=FALSE}
+# Unzip the KMZ to get the KML file inside
+kmz_path <- "StPaul_Police_Gri_LayerToKML.kmz"
+unzip(kmz_path, exdir = tempdir(), overwrite = TRUE)
+kml_path <- list.files(tempdir(), pattern = "\\.kml$", full.names = TRUE)[1]
+
+# Parse KML with xml2
+kml_doc    <- read_xml(kml_path)
+ns         <- c(kml = "http://www.opengis.net/kml/2.2")
+placemarks <- xml_find_all(kml_doc, ".//kml:Placemark", ns)
+
+# Build sf object from scratch — one row per grid cell
+features <- lapply(placemarks, function(pm) {
+  # Grid ID is stored in the <name> tag
+  grid_id  <- xml_text(xml_find_first(pm, "kml:name", ns))
+
+  # Each Placemark may have one or more <Polygon> elements (grid 69 has 2)
+  poly_nodes <- xml_find_all(
+    pm, "kml:MultiGeometry/kml:Polygon/kml:outerBoundaryIs/kml:LinearRing/kml:coordinates", ns
+  )
+  # Also catch single Polygon (no MultiGeometry wrapper)
+  if (length(poly_nodes) == 0) {
+    poly_nodes <- xml_find_all(
+      pm, "kml:Polygon/kml:outerBoundaryIs/kml:LinearRing/kml:coordinates", ns
+    )
+  }
+
+  # Convert coordinate text to numeric matrix
+  coords_list <- lapply(poly_nodes, function(co) {
+    pts <- strsplit(trimws(xml_text(co)), "\\s+")[[1]]
+    do.call(rbind, lapply(pts, function(p) {
+      xy <- as.numeric(strsplit(p, ",")[[1]])
+      c(xy[1], xy[2])  # lon, lat
+    }))
+  })
+
+  # Build polygon or multipolygon geometry
+  if (length(coords_list) == 1) {
+    geom <- st_polygon(list(coords_list[[1]]))
+  } else {
+    geom <- st_multipolygon(lapply(coords_list, function(m) list(m)))
+  }
+
+  st_sf(Name = grid_id, geometry = st_sfc(geom, crs = 4326))
+})
+
+# Combine into one sf object
+grid_sf <- do.call(rbind, features) %>%
+  mutate(Name = as.character(Name))
+
+cat("Grid cells loaded:", nrow(grid_sf), "\n")
+cat("Geometry types:", paste(unique(st_geometry_type(grid_sf)), collapse = ", "), "\n")
+cat("Sample grid IDs:", paste(head(grid_sf$Name, 8), collapse = ", "), "\n")
+```
+
+```{r}
+# Preview the grid on a map
+leaflet(grid_sf) %>%
+  addTiles() %>%
+  addPolygons(
+    color       = "navy",
+    weight      = 1,
+    fillOpacity = 0.1,
+    popup       = ~Name
+  ) %>%
+  setView(lng = -93.09, lat = 44.95, zoom = 12)
+```
+
+## 1.3 Join Shootings to Grid Cells
+
+```{r}
+# Convert shooting points to sf object
+shootings_sf <- full_data %>%
+  filter(!is.na(Lat), !is.na(Long)) %>%
+  st_as_sf(coords = c("Long", "Lat"), crs = 4326)
+
+# Spatial join: assign each shooting to the grid cell it falls within
+shootings_gridded <- st_join(shootings_sf, grid_sf, join = st_within) %>%
+  rename(grid_id = Name) %>%
+  st_drop_geometry()
+
+cat("Matched:", sum(!is.na(shootings_gridded$grid_id)),
+    "of", nrow(shootings_gridded), "shooting records to a grid\n")
+cat("Grid cells with at least one shooting:",
+    n_distinct(na.omit(shootings_gridded$grid_id)), "\n")
+```
+
+------------------------------------------------------------------------
+
+# Section 2: Weekly Aggregation by Grid
+
+Dr. Clark noted that daily aggregation produces too many zeros. Aggregating by week substantially reduces zero inflation and gives a cleaner panel for spatial and time-series modeling.
+
+## 2.1 Build Weekly Grid-Level Panel
+
+```{r}
+all_weeks <- sort(unique(shootings_gridded$week))
+all_grids <- sort(unique(grid_sf$Name))
+
+# Complete panel: every week × grid combination
+panel <- expand.grid(
+  week    = all_weeks,
+  grid_id = all_grids,
+  stringsAsFactors = FALSE
+) %>%
+  as_tibble() %>%
+  mutate(week = as.Date(week))
+
+# Aggregate shootings by week × grid
+weekly_counts <- shootings_gridded %>%
+  filter(!is.na(grid_id), !is.na(week)) %>%
+  group_by(week, grid_id) %>%
+  summarize(count = n(), .groups = "drop")
+
+# Join — missing combos become 0
+panel <- panel %>%
+  left_join(weekly_counts, by = c("week", "grid_id")) %>%
+  replace_na(list(count = 0)) %>%
+  mutate(
+    nfsu       = as.integer(week >= as.Date("2024-01-01")),
+    season     = case_when(
+      month(week) %in% c(12, 1, 2)  ~ "Winter",
+      month(week) %in% c(3, 4, 5)   ~ "Spring",
+      month(week) %in% c(6, 7, 8)   ~ "Summer",
+      month(week) %in% c(9, 10, 11) ~ "Fall"
+    ),
+    season     = factor(season, levels = c("Winter", "Spring", "Summer", "Fall")),
+    week_index = as.integer(difftime(week, min(week), units = "weeks"))
+  )
+
+cat("Panel:", nrow(panel), "rows |",
+    length(all_weeks), "weeks ×", length(all_grids), "grids\n")
+```
+
+## 2.2 Check Zero Proportion
+
+```{r}
+cat("Proportion of zeros (weekly grid-level):", round(mean(panel$count == 0), 3), "\n")
+
+ggplot(panel, aes(x = count)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "white") +
+  labs(
+    title = "Distribution of Weekly Shooting Counts by Grid Cell",
+    x     = "Shootings per Grid per Week",
+    y     = "Frequency"
+  ) +
+  theme_minimal()
+```
+
+## 2.3 Identify High-Impact Grid Cells
+
+```{r}
+grid_totals <- panel %>%
+  group_by(grid_id) %>%
+  summarize(total = sum(count), .groups = "drop") %>%
+  arrange(desc(total))
+
+knitr::kable(head(grid_totals, 20), caption = "Top 20 Grids by Total Shootings")
+
+# Top quartile of activity
+top_grids <- grid_totals %>%
+  filter(total >= quantile(grid_totals$total, 0.75)) %>%
+  pull(grid_id)
+
+cat("High-impact grids (top quartile):", length(top_grids), "\n")
+
+panel_hot <- panel %>% filter(grid_id %in% top_grids)
+cat("Zeros in high-impact panel:", round(mean(panel_hot$count == 0), 3), "\n")
+```
+
+## 2.4 Weekly Time Trend
+
+```{r}
+weekly_total <- panel %>%
+  group_by(week, nfsu) %>%
+  summarize(count = sum(count), .groups = "drop")
+
+ggplot(weekly_total, aes(x = week, y = count)) +
+  geom_line(color = "steelblue") +
+  geom_smooth(method = "loess", se = TRUE, color = "darkblue") +
+  geom_vline(xintercept = as.Date("2024-01-01"), color = "red", linetype = "dashed") +
+  annotate("text", x = as.Date("2024-01-01"), y = max(weekly_total$count),
+           label = "NFSU Start", color = "red", hjust = -0.1, size = 3) +
+  labs(title = "Weekly Shooting Counts Across All Grids", x = "Week", y = "Total Shootings") +
+  theme_minimal()
+```
+
+------------------------------------------------------------------------
+
+# Section 3: Spatial Structure — Moran's I and LISA
+
+## 3.1 Aggregate Spatially (Collapse Time)
+
+```{r}
+grid_spatial <- panel %>%
+  group_by(grid_id) %>%
+  summarize(total = sum(count), .groups = "drop")
+
+grid_sf_counts <- grid_sf %>%
+  rename(grid_id = Name) %>%
+  left_join(grid_spatial, by = "grid_id") %>%
+  replace_na(list(total = 0))
+```
+
+## 3.2 Map of Shooting Counts by Grid
+
+```{r}
+pal <- colorNumeric("YlOrRd", domain = grid_sf_counts$total)
+
+leaflet(grid_sf_counts) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor   = ~pal(total),
+    fillOpacity = 0.7,
+    color       = "black",
+    weight      = 0.5,
+    popup       = ~paste("<b>Grid:</b>", grid_id, "<br><b>Total Shootings:</b>", total)
+  ) %>%
+  addLegend(pal = pal, values = ~total, title = "Shootings", position = "bottomright")
+```
+
+## 3.3 Build Spatial Weights (Neighborhood Matrix)
+
+```{r}
+# Queen contiguity — grids sharing any edge or corner are neighbors
+nb <- poly2nb(grid_sf_counts, queen = TRUE)
+lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+cat("Grid regions:", length(nb), "\n")
+cat("Average neighbors:", round(mean(card(nb)), 2), "\n")
+```
+
+## 3.4 Global Moran's I
+
+```{r}
+moran_result <- moran.test(
+  grid_sf_counts$total,
+  lw,
+  zero.policy = TRUE,
+  alternative = "greater"
+)
+print(moran_result)
+
+moran.plot(
+  grid_sf_counts$total, lw,
+  zero.policy = TRUE,
+  xlab = "Shooting Count (Grid)",
+  ylab = "Spatially Lagged Count (Neighbors)",
+  main = "Moran's I Scatter Plot — Total Shootings by Grid"
+)
+```
+
+## 3.5 LISA — Local Indicators of Spatial Association
+
+```{r}
+lisa <- localmoran(grid_sf_counts$total, lw, zero.policy = TRUE, alternative = "two.sided")
+
+grid_sf_counts <- grid_sf_counts %>%
+  mutate(
+    lisa_I   = lisa[, "Ii"],
+    lisa_p   = lisa[, "Pr(z != E(Ii))"],
+    z_score  = as.numeric(scale(total)),
+    lag_z    = lag.listw(lw, z_score, zero.policy = TRUE),
+    quad_sig = case_when(
+      lisa_p >= 0.05             ~ "Not Significant",
+      z_score > 0 & lag_z > 0   ~ "High-High (Hotspot)",
+      z_score < 0 & lag_z < 0   ~ "Low-Low (Cold spot)",
+      z_score > 0 & lag_z < 0   ~ "High-Low (Outlier)",
+      z_score < 0 & lag_z > 0   ~ "Low-High (Outlier)"
+    ),
+    quad_sig = factor(quad_sig, levels = c(
+      "High-High (Hotspot)", "Low-Low (Cold spot)",
+      "High-Low (Outlier)", "Low-High (Outlier)", "Not Significant"
+    ))
+  )
+```
+
+## 3.6 LISA Cluster Map
+
+```{r}
+lisa_colors <- c(
+  "High-High (Hotspot)" = "#d7191c",
+  "Low-Low (Cold spot)" = "#2c7bb6",
+  "High-Low (Outlier)"  = "#fdae61",
+  "Low-High (Outlier)"  = "#abd9e9",
+  "Not Significant"     = "#f0f0f0"
+)
+
+pal_lisa <- colorFactor(palette = lisa_colors, domain = names(lisa_colors))
+
+leaflet(grid_sf_counts) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor   = ~pal_lisa(quad_sig),
+    fillOpacity = 0.75,
+    color       = "black",
+    weight      = 0.5,
+    popup       = ~paste(
+      "<b>Grid:</b>",    grid_id, "<br>",
+      "<b>Total:</b>",   total,   "<br>",
+      "<b>LISA:</b>",    quad_sig, "<br>",
+      "<b>p-value:</b>", round(lisa_p, 4)
+    )
+  ) %>%
+  addLegend(pal = pal_lisa, values = ~quad_sig,
+            title = "LISA Cluster Type", position = "bottomright") %>%
+  setView(lng = -93.09, lat = 44.95, zoom = 12)
+```
+
+## 3.7 LISA Summary Table
+
+```{r}
+grid_sf_counts %>%
+  st_drop_geometry() %>%
+  group_by(quad_sig) %>%
+  summarize(n_grids = n(), .groups = "drop") %>%
+  arrange(desc(n_grids)) %>%
+  knitr::kable(caption = "LISA Cluster Classification — Grid Count")
+```
+
+------------------------------------------------------------------------
+
+# Section 4: Poisson Regression (Weekly, Time-Level)
+
+## 4.1 Add Lag Variable
+
+```{r}
+panel <- panel %>%
+  arrange(grid_id, week) %>%
+  group_by(grid_id) %>%
+  mutate(
+    lag_count     = lag(count, 1),
+    log_lag_count = log(lag_count + 1)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(lag_count))
+```
+
+## 4.2 Weekly Aggregated Models (Time Only)
+
+```{r}
+weekly_model_data <- panel %>%
+  group_by(week, week_index, nfsu, season) %>%
+  summarize(
+    count     = sum(count),
+    lag_count = sum(lag_count),
+    .groups   = "drop"
+  ) %>%
+  mutate(log_lag = log(lag_count + 1))
+
+# Four nested models
+m1 <- glm(count ~ week_index,
+           data = weekly_model_data, family = poisson(link = "log"))
+
+m2 <- glm(count ~ week_index + nfsu,
+           data = weekly_model_data, family = poisson(link = "log"))
+
+m3 <- glm(count ~ week_index + nfsu + season,
+           data = weekly_model_data, family = poisson(link = "log"))
+
+m4 <- glm(count ~ week_index + nfsu + season + log_lag,
+           data = weekly_model_data, family = poisson(link = "log"))
+
+# Comparison table
+data.frame(
+  Model     = c("M1: Trend", "M2: +NFSU", "M3: +Season", "M4: +Log-Lag"),
+  AIC       = round(c(AIC(m1), AIC(m2), AIC(m3), AIC(m4)), 2),
+  BIC       = round(c(BIC(m1), BIC(m2), BIC(m3), BIC(m4)), 2),
+  Resid_Dev = round(c(deviance(m1), deviance(m2), deviance(m3), deviance(m4)), 2)
+) %>%
+  knitr::kable(caption = "Model Comparison — AIC / BIC / Residual Deviance")
+```
+
+## 4.3 Likelihood Ratio Tests
+
+```{r}
+lrtest(m1, m2)   # Is NFSU significant?
+lrtest(m2, m3)   # Does season improve fit?
+lrtest(m3, m4)   # Does log-lag improve fit?
+```
+
+## 4.4 Dispersion Check
+
+```{r}
+dispersiontest(m4)
+
+cat("Dispersion (deviance/df):", round(deviance(m4) / df.residual(m4), 3), "\n")
+
+# Fit Negative Binomial for comparison
+m4_nb <- glm.nb(count ~ week_index + nfsu + season + log_lag,
+                data = weekly_model_data)
+
+cat("Poisson AIC:", round(AIC(m4),    2), "\n")
+cat("NegBin  AIC:", round(AIC(m4_nb), 2), "\n")
+cat("Use whichever has the lower AIC.\n")
+```
+
+## 4.5 Best Model Summary and IRRs
+
+```{r}
+# Update 'best_model' to m4_nb if NegBin AIC is lower
+best_model <- m4
+
+summary(best_model)
+
+# Exponentiated coefficients = Incidence Rate Ratios
+irr <- exp(cbind(IRR = coef(best_model), confint(best_model)))
+knitr::kable(round(irr, 4), caption = "Incidence Rate Ratios")
+```
+
+------------------------------------------------------------------------
+
+# Section 5: Model Diagnostics
+
+## 5.1 Deviance Residuals vs Fitted
+
+```{r}
+weekly_model_data <- weekly_model_data %>%
+  mutate(
+    fitted_vals = fitted(best_model),
+    dev_resid   = residuals(best_model, type = "deviance")
+  )
+
+ggplot(weekly_model_data, aes(x = fitted_vals, y = dev_resid)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_smooth(method = "loess", se = FALSE, color = "darkblue") +
+  labs(title = "Deviance Residuals vs Fitted Values",
+       x = "Fitted Values", y = "Deviance Residuals") +
+  theme_minimal()
+```
+
+## 5.2 ACF and PACF of Residuals
+
+```{r fig.height=4}
+par(mfrow = c(1, 2))
+acf(weekly_model_data$dev_resid,
+    main = "ACF — Deviance Residuals", lag.max = 30)
+pacf(weekly_model_data$dev_resid,
+     main = "PACF — Deviance Residuals", lag.max = 30)
+par(mfrow = c(1, 1))
+```
+
+## 5.3 QQ Plot
+
+```{r}
+ggplot(weekly_model_data, aes(sample = dev_resid)) +
+  stat_qq(color = "steelblue") +
+  stat_qq_line(color = "red") +
+  labs(title = "QQ Plot — Deviance Residuals",
+       x = "Theoretical Quantiles", y = "Sample Quantiles") +
+  theme_minimal()
+```
+
+## 5.4 Residuals Over Time
+
+```{r}
+ggplot(weekly_model_data, aes(x = week, y = dev_resid)) +
+  geom_line(color = "steelblue", alpha = 0.7) +
+  geom_point(size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = as.Date("2024-01-01"), color = "darkred", linetype = "dotted") +
+  annotate("text", x = as.Date("2024-01-01"),
+           y = max(weekly_model_data$dev_resid, na.rm = TRUE),
+           label = "NFSU", color = "darkred", hjust = -0.1, size = 3) +
+  labs(title = "Deviance Residuals Over Time",
+       x = "Week", y = "Deviance Residual") +
+  theme_minimal()
+```
+
+------------------------------------------------------------------------
+
+# Section 6: Spatial Residual Diagnostics
+
+## 6.1 Grid-Level Poisson Model
+
+```{r}
+panel_model <- panel %>%
+  filter(grid_id %in% top_grids) %>%
+  mutate(grid_id = factor(grid_id))
+
+m_grid <- glm(
+  count ~ week_index + nfsu + season + log_lag_count + grid_id,
+  data   = panel_model,
+  family = poisson(link = "log")
+)
+
+cat("Grid-level Poisson AIC:", round(AIC(m_grid), 2), "\n")
+cat("Dispersion:", round(deviance(m_grid) / df.residual(m_grid), 3), "\n")
+```
+
+## 6.2 Spatial Residual Map
+
+```{r}
+panel_model <- panel_model %>%
+  mutate(dev_resid = residuals(m_grid, type = "deviance"))
+
+grid_resid <- panel_model %>%
+  group_by(grid_id) %>%
+  summarize(mean_resid = mean(dev_resid), .groups = "drop") %>%
+  mutate(grid_id = as.character(grid_id))
+
+grid_sf_resid <- grid_sf %>%
+  rename(grid_id = Name) %>%
+  inner_join(grid_resid, by = "grid_id")
+
+pal_resid <- colorNumeric(c("blue", "white", "red"), domain = grid_sf_resid$mean_resid)
+
+leaflet(grid_sf_resid) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor   = ~pal_resid(mean_resid),
+    fillOpacity = 0.7,
+    color       = "black", weight = 0.5,
+    popup = ~paste("<b>Grid:</b>", grid_id,
+                   "<br><b>Mean Residual:</b>", round(mean_resid, 3))
+  ) %>%
+  addLegend(pal = pal_resid, values = ~mean_resid,
+            title = "Mean Dev. Residual<br>(Red = underpredicted)",
+            position = "bottomright")
+```
+
+## 6.3 Moran's I on Spatial Residuals
+
+```{r}
+grid_sf_moran <- grid_sf %>%
+  rename(grid_id = Name) %>%
+  left_join(grid_resid, by = "grid_id") %>%
+  replace_na(list(mean_resid = 0))
+
+nb_resid <- poly2nb(grid_sf_moran, queen = TRUE)
+lw_resid <- nb2listw(nb_resid, style = "W", zero.policy = TRUE)
+
+moran_resid <- moran.test(grid_sf_moran$mean_resid, lw_resid, zero.policy = TRUE)
+print(moran_resid)
+cat("\nIf significant: spatial structure remains — space-time model needed.\n")
+```
+
+------------------------------------------------------------------------
+
+# Section 7: Before vs After NFSU — Spatial Comparison
+
+## 7.1 LISA Before vs After
+
+```{r}
+run_lisa <- function(df_period, grid_polygon, nb_weights) {
+  counts <- df_period %>%
+    group_by(grid_id) %>%
+    summarize(total = sum(count), .groups = "drop")
+
+  gdf <- grid_polygon %>%
+    left_join(counts, by = "grid_id") %>%
+    replace_na(list(total = 0))
+
+  lisa_out <- localmoran(gdf$total, nb_weights, zero.policy = TRUE)
+
+  gdf %>%
+    mutate(
+      lisa_p   = lisa_out[, "Pr(z != E(Ii))"],
+      z_score  = as.numeric(scale(total)),
+      lag_z    = lag.listw(nb_weights, z_score, zero.policy = TRUE),
+      quad_sig = case_when(
+        lisa_p >= 0.05             ~ "Not Significant",
+        z_score > 0 & lag_z > 0   ~ "High-High (Hotspot)",
+        z_score < 0 & lag_z < 0   ~ "Low-Low (Cold spot)",
+        z_score > 0 & lag_z < 0   ~ "High-Low (Outlier)",
+        z_score < 0 & lag_z > 0   ~ "Low-High (Outlier)"
+      ),
+      quad_sig = factor(quad_sig, levels = c(
+        "High-High (Hotspot)", "Low-Low (Cold spot)",
+        "High-Low (Outlier)", "Low-High (Outlier)", "Not Significant"
+      ))
+    )
+}
+
+grid_base    <- grid_sf %>% rename(grid_id = Name)
+panel_before <- panel %>% filter(nfsu == 0)
+panel_after  <- panel %>% filter(nfsu == 1)
+
+lisa_before <- run_lisa(panel_before, grid_base, lw)
+lisa_after  <- run_lisa(panel_after,  grid_base, lw)
+```
+
+```{r}
+pal_lisa2 <- colorFactor(
+  palette = c("#d7191c", "#2c7bb6", "#fdae61", "#abd9e9", "#f0f0f0"),
+  levels  = c("High-High (Hotspot)", "Low-Low (Cold spot)",
+              "High-Low (Outlier)", "Low-High (Outlier)", "Not Significant")
+)
+
+# Before NFSU
+leaflet(lisa_before) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor = ~pal_lisa2(quad_sig), fillOpacity = 0.75,
+    color = "black", weight = 0.5,
+    popup = ~paste("<b>Grid:</b>", grid_id, "<br><b>LISA:</b>", quad_sig)
+  ) %>%
+  addLegend(pal = pal_lisa2, values = ~quad_sig,
+            title = "LISA: Before NFSU", position = "bottomright") %>%
+  setView(lng = -93.09, lat = 44.95, zoom = 12)
+```
+
+```{r}
+# After NFSU
+leaflet(lisa_after) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor = ~pal_lisa2(quad_sig), fillOpacity = 0.75,
+    color = "black", weight = 0.5,
+    popup = ~paste("<b>Grid:</b>", grid_id, "<br><b>LISA:</b>", quad_sig)
+  ) %>%
+  addLegend(pal = pal_lisa2, values = ~quad_sig,
+            title = "LISA: After NFSU", position = "bottomright") %>%
+  setView(lng = -93.09, lat = 44.95, zoom = 12)
+```
+
+## 7.2 Hotspot Stability Table
+
+```{r}
+hotspot_comparison <- lisa_before %>%
+  st_drop_geometry() %>%
+  dplyr::select(grid_id, before_quad = quad_sig) %>%
+  left_join(
+    lisa_after %>% st_drop_geometry() %>% dplyr::select(grid_id, after_quad = quad_sig),
+    by = "grid_id"
+  ) %>%
+  mutate(
+    status = case_when(
+      before_quad == "High-High (Hotspot)" & after_quad == "High-High (Hotspot)" ~ "Persistent Hotspot",
+      before_quad == "High-High (Hotspot)" & after_quad != "High-High (Hotspot)" ~ "Cooled (NFSU effect?)",
+      before_quad != "High-High (Hotspot)" & after_quad == "High-High (Hotspot)" ~ "Emerging Hotspot",
+      TRUE ~ "Neither"
+    )
+  )
+
+hotspot_comparison %>%
+  filter(status != "Neither") %>%
+  arrange(status, grid_id) %>%
+  knitr::kable(caption = "Hotspot Status Before vs After NFSU")
+```
+
+------------------------------------------------------------------------
+
+# Section 8: Session Info
+
+```{r}
+sessionInfo()
+```
