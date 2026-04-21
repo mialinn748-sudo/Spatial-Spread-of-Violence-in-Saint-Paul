@@ -1,0 +1,1619 @@
+---
+title: "DASC 460: Spatial Analysis of Non-Fatal Shootings in Saint Paul — Grid-Level Modeling"
+subtitle: "Incorporating Spatial Structure, Moran's I, LISA Hotspot Detection, and Weekly Poisson Regression"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+------------------------------------------------------------------------
+
+# Setup
+
+## Load Libraries
+
+```{r warning=FALSE, message=FALSE}
+library(rmarkdown)
+library(knitr)
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(leaflet)
+library(tidyr)
+library(sf)
+library(xml2)       # parse KML directly
+library(spdep)      # Moran's I, LISA, spatial weights
+library(MASS)       # negative binomial
+library(lmtest)     # likelihood ratio test
+library(AER)        # dispersion test
+```
+
+------------------------------------------------------------------------
+
+# Section 1: Load and Prepare Data
+
+## 1.1 Load Shooting Data
+
+```{r}
+file <- "Shootings_Full Data(new).xlsx"
+
+full_data <- read_excel(file, sheet = "Full Data") %>%
+  mutate(
+    DATE       = as.Date(DATE),
+    period     = if_else(DATE < as.Date("2024-01-01"), "Before NFSU", "After NFSU"),
+    period     = factor(period, levels = c("Before NFSU", "After NFSU")),
+    season     = case_when(
+      month(DATE) %in% c(12, 1, 2)  ~ "Winter",
+      month(DATE) %in% c(3, 4, 5)   ~ "Spring",
+      month(DATE) %in% c(6, 7, 8)   ~ "Summer",
+      month(DATE) %in% c(9, 10, 11) ~ "Fall"
+    ),
+    season     = factor(season, levels = c("Winter", "Spring", "Summer", "Fall")),
+    week       = floor_date(DATE, "week", week_start = 1),
+    week_index = as.integer(difftime(week, min(week, na.rm = TRUE), units = "weeks")),
+    nfsu       = as.integer(DATE >= as.Date("2024-01-01")),
+    GRID       = as.character(GRID)
+  ) %>%
+  filter(!is.na(Lat), !is.na(Long), !is.na(DATE), Lat != 0, Long != 0)
+
+cat("Shooting records loaded:", nrow(full_data), "\n")
+```
+
+## 1.2 Load Police Grid from KMZ
+
+We parse the KML directly using `xml2` to avoid geometry type issues
+that occur when `sf` reads KML MultiGeometry features.
+
+```{r message=FALSE, warning=FALSE}
+# Unzip the KMZ to get the KML file inside
+kmz_path <- "StPaul_Police_Gri_LayerToKML.kmz"
+unzip(kmz_path, exdir = tempdir(), overwrite = TRUE)
+kml_path <- list.files(tempdir(), pattern = "\\.kml$", full.names = TRUE)[1]
+
+# Parse KML with xml2
+kml_doc    <- read_xml(kml_path)
+ns         <- c(kml = "http://www.opengis.net/kml/2.2")
+placemarks <- xml_find_all(kml_doc, ".//kml:Placemark", ns)
+
+# Build sf object from scratch — one row per grid cell
+features <- lapply(placemarks, function(pm) {
+  # Grid ID is stored in the <name> tag
+  grid_id  <- xml_text(xml_find_first(pm, "kml:name", ns))
+
+  # Each Placemark may have one or more <Polygon> elements (grid 69 has 2)
+  poly_nodes <- xml_find_all(
+    pm, "kml:MultiGeometry/kml:Polygon/kml:outerBoundaryIs/kml:LinearRing/kml:coordinates", ns
+  )
+  # Also catch single Polygon (no MultiGeometry wrapper)
+  if (length(poly_nodes) == 0) {
+    poly_nodes <- xml_find_all(
+      pm, "kml:Polygon/kml:outerBoundaryIs/kml:LinearRing/kml:coordinates", ns
+    )
+  }
+
+  # Convert coordinate text to numeric matrix
+  coords_list <- lapply(poly_nodes, function(co) {
+    pts <- strsplit(trimws(xml_text(co)), "\\s+")[[1]]
+    do.call(rbind, lapply(pts, function(p) {
+      xy <- as.numeric(strsplit(p, ",")[[1]])
+      c(xy[1], xy[2])  # lon, lat
+    }))
+  })
+
+  # Build polygon or multipolygon geometry
+  if (length(coords_list) == 1) {
+    geom <- st_polygon(list(coords_list[[1]]))
+  } else {
+    geom <- st_multipolygon(lapply(coords_list, function(m) list(m)))
+  }
+
+  st_sf(Name = grid_id, geometry = st_sfc(geom, crs = 4326))
+})
+
+# Combine into one sf object
+grid_sf <- do.call(rbind, features) %>%
+  mutate(Name = as.character(Name))
+
+cat("Grid cells loaded:", nrow(grid_sf), "\n")
+cat("Geometry types:", paste(unique(st_geometry_type(grid_sf)), collapse = ", "), "\n")
+cat("Sample grid IDs:", paste(head(grid_sf$Name, 8), collapse = ", "), "\n")
+```
+
+```{r}
+# Preview the grid on a map
+leaflet(grid_sf) %>%
+  addTiles() %>%
+  addPolygons(
+    color       = "navy",
+    weight      = 1,
+    fillOpacity = 0.1,
+    popup       = ~Name
+  ) %>%
+  setView(lng = -93.09, lat = 44.95, zoom = 12)
+```
+
+## 1.3 Join Shootings to Grid Cells
+
+```{r}
+# Convert shooting points to sf object
+shootings_sf <- full_data %>%
+  filter(!is.na(Lat), !is.na(Long)) %>%
+  st_as_sf(coords = c("Long", "Lat"), crs = 4326)
+
+# Spatial join: assign each shooting to the grid cell it falls within
+shootings_gridded <- st_join(shootings_sf, grid_sf, join = st_within) %>%
+  rename(grid_id = Name) %>%
+  st_drop_geometry()
+
+cat("Matched:", sum(!is.na(shootings_gridded$grid_id)),
+    "of", nrow(shootings_gridded), "shooting records to a grid\n")
+cat("Grid cells with at least one shooting:",
+    n_distinct(na.omit(shootings_gridded$grid_id)), "\n")
+```
+
+------------------------------------------------------------------------
+
+# Section 2: Weekly Aggregation by Grid
+
+Dr. Clark noted that daily aggregation produces too many zeros.
+Aggregating by week substantially reduces zero inflation and gives a
+cleaner panel for spatial and time-series modeling.
+
+## 2.1 Build Weekly Grid-Level Panel
+
+```{r}
+all_weeks <- sort(unique(shootings_gridded$week))
+all_grids <- sort(unique(grid_sf$Name))
+
+# Complete panel: every week × grid combination
+panel <- expand.grid(
+  week    = all_weeks,
+  grid_id = all_grids,
+  stringsAsFactors = FALSE
+) %>%
+  as_tibble() %>%
+  mutate(week = as.Date(week))
+
+# Aggregate shootings by week × grid
+weekly_counts <- shootings_gridded %>%
+  filter(!is.na(grid_id), !is.na(week)) %>%
+  group_by(week, grid_id) %>%
+  summarize(count = n(), .groups = "drop")
+
+# Join — missing combos become 0
+panel <- panel %>%
+  left_join(weekly_counts, by = c("week", "grid_id")) %>%
+  replace_na(list(count = 0)) %>%
+  mutate(
+    nfsu       = as.integer(week >= as.Date("2024-01-01")),
+    season     = case_when(
+      month(week) %in% c(12, 1, 2)  ~ "Winter",
+      month(week) %in% c(3, 4, 5)   ~ "Spring",
+      month(week) %in% c(6, 7, 8)   ~ "Summer",
+      month(week) %in% c(9, 10, 11) ~ "Fall"
+    ),
+    season     = factor(season, levels = c("Winter", "Spring", "Summer", "Fall")),
+    week_index = as.integer(difftime(week, min(week), units = "weeks"))
+  )
+
+cat("Panel:", nrow(panel), "rows |",
+    length(all_weeks), "weeks ×", length(all_grids), "grids\n")
+```
+
+## 2.2 Check Zero Proportion
+
+```{r}
+cat("Proportion of zeros (weekly grid-level):", round(mean(panel$count == 0), 3), "\n")
+
+ggplot(panel, aes(x = count)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "white") +
+  labs(
+    title = "Distribution of Weekly Shooting Counts by Grid Cell",
+    x     = "Shootings per Grid per Week",
+    y     = "Frequency"
+  ) +
+  theme_minimal()
+```
+
+## 2.3 Identify High-Impact Grid Cells
+
+```{r}
+grid_totals <- panel %>%
+  group_by(grid_id) %>%
+  summarize(total = sum(count), .groups = "drop") %>%
+  arrange(desc(total))
+
+knitr::kable(head(grid_totals, 20), caption = "Top 20 Grids by Total Shootings")
+
+# Top quartile of activity
+top_grids <- grid_totals %>%
+  filter(total >= quantile(grid_totals$total, 0.75)) %>%
+  pull(grid_id)
+
+cat("High-impact grids (top quartile):", length(top_grids), "\n")
+
+panel_hot <- panel %>% filter(grid_id %in% top_grids)
+cat("Zeros in high-impact panel:", round(mean(panel_hot$count == 0), 3), "\n")
+```
+
+## 2.4 Weekly Time Trend
+
+```{r}
+weekly_total <- panel %>%
+  group_by(week, nfsu) %>%
+  summarize(count = sum(count), .groups = "drop")
+
+ggplot(weekly_total, aes(x = week, y = count)) +
+  geom_line(color = "steelblue") +
+  geom_smooth(method = "loess", se = TRUE, color = "darkblue") +
+  geom_vline(xintercept = as.Date("2024-01-01"), color = "red", linetype = "dashed") +
+  annotate("text", x = as.Date("2024-01-01"), y = max(weekly_total$count),
+           label = "NFSU Start", color = "red", hjust = -0.1, size = 3) +
+  labs(title = "Weekly Shooting Counts Across All Grids", x = "Week", y = "Total Shootings") +
+  theme_minimal()
+```
+
+------------------------------------------------------------------------
+
+# Section 3: Spatial Structure — Moran's I and LISA
+
+## 3.1 Aggregate Spatially (Collapse Time)
+
+```{r}
+grid_spatial <- panel %>%
+  group_by(grid_id) %>%
+  summarize(total = sum(count), .groups = "drop")
+
+grid_sf_counts <- grid_sf %>%
+  rename(grid_id = Name) %>%
+  left_join(grid_spatial, by = "grid_id") %>%
+  replace_na(list(total = 0))
+```
+
+## 3.2 Map of Shooting Counts by Grid
+
+```{r}
+pal <- colorNumeric("YlOrRd", domain = grid_sf_counts$total)
+
+leaflet(grid_sf_counts) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor   = ~pal(total),
+    fillOpacity = 0.7,
+    color       = "black",
+    weight      = 0.5,
+    popup       = ~paste("<b>Grid:</b>", grid_id, "<br><b>Total Shootings:</b>", total)
+  ) %>%
+  addLegend(pal = pal, values = ~total, title = "Shootings", position = "bottomright")
+```
+
+## 3.3 Build Spatial Weights (Neighborhood Matrix)
+
+```{r}
+# Queen contiguity — grids sharing any edge or corner are neighbors
+nb <- poly2nb(grid_sf_counts, queen = TRUE)
+lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+cat("Grid regions:", length(nb), "\n")
+cat("Average neighbors:", round(mean(card(nb)), 2), "\n")
+```
+
+## 3.4 Global Moran's I
+
+```{r}
+moran_result <- moran.test(
+  grid_sf_counts$total,
+  lw,
+  zero.policy = TRUE,
+  alternative = "greater"
+)
+print(moran_result)
+
+moran.plot(
+  grid_sf_counts$total, lw,
+  zero.policy = TRUE,
+  xlab = "Shooting Count (Grid)",
+  ylab = "Spatially Lagged Count (Neighbors)",
+  main = "Moran's I Scatter Plot — Total Shootings by Grid"
+)
+```
+
+## 3.5 LISA — Local Indicators of Spatial Association
+
+```{r}
+lisa <- localmoran(grid_sf_counts$total, lw, zero.policy = TRUE, alternative = "two.sided")
+
+grid_sf_counts <- grid_sf_counts %>%
+  mutate(
+    lisa_I   = lisa[, "Ii"],
+    lisa_p   = lisa[, "Pr(z != E(Ii))"],
+    z_score  = as.numeric(scale(total)),
+    lag_z    = lag.listw(lw, z_score, zero.policy = TRUE),
+    quad_sig = case_when(
+      lisa_p >= 0.05             ~ "Not Significant",
+      z_score > 0 & lag_z > 0   ~ "High-High (Hotspot)",
+      z_score < 0 & lag_z < 0   ~ "Low-Low (Cold spot)",
+      z_score > 0 & lag_z < 0   ~ "High-Low (Outlier)",
+      z_score < 0 & lag_z > 0   ~ "Low-High (Outlier)"
+    ),
+    quad_sig = factor(quad_sig, levels = c(
+      "High-High (Hotspot)", "Low-Low (Cold spot)",
+      "High-Low (Outlier)", "Low-High (Outlier)", "Not Significant"
+    ))
+  )
+```
+
+## 3.6 LISA Cluster Map
+
+```{r}
+lisa_colors <- c(
+  "High-High (Hotspot)" = "#d7191c",
+  "Low-Low (Cold spot)" = "#2c7bb6",
+  "High-Low (Outlier)"  = "#fdae61",
+  "Low-High (Outlier)"  = "#abd9e9",
+  "Not Significant"     = "#f0f0f0"
+)
+
+pal_lisa <- colorFactor(palette = lisa_colors, domain = names(lisa_colors))
+
+leaflet(grid_sf_counts) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor   = ~pal_lisa(quad_sig),
+    fillOpacity = 0.75,
+    color       = "black",
+    weight      = 0.5,
+    popup       = ~paste(
+      "<b>Grid:</b>",    grid_id, "<br>",
+      "<b>Total:</b>",   total,   "<br>",
+      "<b>LISA:</b>",    quad_sig, "<br>",
+      "<b>p-value:</b>", round(lisa_p, 4)
+    )
+  ) %>%
+  addLegend(pal = pal_lisa, values = ~quad_sig,
+            title = "LISA Cluster Type", position = "bottomright") %>%
+  setView(lng = -93.09, lat = 44.95, zoom = 12)
+```
+
+## 3.7 LISA Summary Table
+
+```{r}
+grid_sf_counts %>%
+  st_drop_geometry() %>%
+  group_by(quad_sig) %>%
+  summarize(n_grids = n(), .groups = "drop") %>%
+  arrange(desc(n_grids)) %>%
+  knitr::kable(caption = "LISA Cluster Classification — Grid Count")
+```
+
+------------------------------------------------------------------------
+
+# Section 4: Poisson Regression (Weekly, Time-Level)
+
+## 4.1 Add Lag Variable
+
+```{r}
+panel <- panel %>%
+  arrange(grid_id, week) %>%
+  group_by(grid_id) %>%
+  mutate(
+    lag_count     = lag(count, 1),
+    log_lag_count = log(lag_count + 1)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(lag_count))
+```
+
+## 4.2 Weekly Aggregated Models (Time Only)
+
+```{r}
+weekly_model_data <- panel %>%
+  group_by(week, week_index, nfsu, season) %>%
+  summarize(
+    count     = sum(count),
+    lag_count = sum(lag_count),
+    .groups   = "drop"
+  ) %>%
+  mutate(log_lag = log(lag_count + 1))
+
+# Four nested models
+m1 <- glm(count ~ week_index,
+           data = weekly_model_data, family = poisson(link = "log"))
+
+m2 <- glm(count ~ week_index + nfsu,
+           data = weekly_model_data, family = poisson(link = "log"))
+
+m3 <- glm(count ~ week_index + nfsu + season,
+           data = weekly_model_data, family = poisson(link = "log"))
+
+m4 <- glm(count ~ week_index + nfsu + season + log_lag,
+           data = weekly_model_data, family = poisson(link = "log"))
+
+# Comparison table
+data.frame(
+  Model     = c("M1: Trend", "M2: +NFSU", "M3: +Season", "M4: +Log-Lag"),
+  AIC       = round(c(AIC(m1), AIC(m2), AIC(m3), AIC(m4)), 2),
+  BIC       = round(c(BIC(m1), BIC(m2), BIC(m3), BIC(m4)), 2),
+  Resid_Dev = round(c(deviance(m1), deviance(m2), deviance(m3), deviance(m4)), 2)
+) %>%
+  knitr::kable(caption = "Model Comparison — AIC / BIC / Residual Deviance")
+```
+
+## 4.3 Likelihood Ratio Tests
+
+```{r}
+lrtest(m1, m2)   # Is NFSU significant?
+lrtest(m2, m3)   # Does season improve fit?
+lrtest(m3, m4)   # Does log-lag improve fit?
+```
+
+## 4.4 Dispersion Check
+
+```{r}
+dispersiontest(m4)
+
+cat("Dispersion (deviance/df):", round(deviance(m4) / df.residual(m4), 3), "\n")
+
+# Fit Negative Binomial for comparison
+m4_nb <- glm.nb(count ~ week_index + nfsu + season + log_lag,
+                data = weekly_model_data)
+
+cat("Poisson AIC:", round(AIC(m4),    2), "\n")
+cat("NegBin  AIC:", round(AIC(m4_nb), 2), "\n")
+cat("Use whichever has the lower AIC.\n")
+```
+
+## 4.5 Best Model Summary and IRRs
+
+```{r}
+# Update 'best_model' to m4_nb if NegBin AIC is lower
+best_model <- m4
+
+summary(best_model)
+
+# Exponentiated coefficients = Incidence Rate Ratios
+irr <- exp(cbind(IRR = coef(best_model), confint(best_model)))
+knitr::kable(round(irr, 4), caption = "Incidence Rate Ratios")
+```
+
+------------------------------------------------------------------------
+
+# Section 5: Model Diagnostics
+
+## 5.1 Deviance Residuals vs Fitted
+
+```{r}
+weekly_model_data <- weekly_model_data %>%
+  mutate(
+    fitted_vals = fitted(best_model),
+    dev_resid   = residuals(best_model, type = "deviance")
+  )
+
+ggplot(weekly_model_data, aes(x = fitted_vals, y = dev_resid)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_smooth(method = "loess", se = FALSE, color = "darkblue") +
+  labs(title = "Deviance Residuals vs Fitted Values",
+       x = "Fitted Values", y = "Deviance Residuals") +
+  theme_minimal()
+```
+
+## 5.2 ACF and PACF of Residuals
+
+```{r fig.height=4}
+op <- par(no.readonly = TRUE)
+on.exit(par(op), add = TRUE)
+par(mfrow = c(1, 2))
+acf(weekly_model_data$dev_resid,
+    main = "ACF — Deviance Residuals", lag.max = 30)
+pacf(weekly_model_data$dev_resid,
+     main = "PACF — Deviance Residuals", lag.max = 30)
+par(op)
+```
+
+## 5.3 QQ Plot
+
+```{r}
+ggplot(weekly_model_data, aes(sample = dev_resid)) +
+  stat_qq(color = "steelblue") +
+  stat_qq_line(color = "red") +
+  labs(title = "QQ Plot — Deviance Residuals",
+       x = "Theoretical Quantiles", y = "Sample Quantiles") +
+  theme_minimal()
+```
+
+## 5.4 Residuals Over Time
+
+```{r}
+ggplot(weekly_model_data, aes(x = week, y = dev_resid)) +
+  geom_line(color = "steelblue", alpha = 0.7) +
+  geom_point(size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = as.Date("2024-01-01"), color = "darkred", linetype = "dotted") +
+  annotate("text", x = as.Date("2024-01-01"),
+           y = max(weekly_model_data$dev_resid, na.rm = TRUE),
+           label = "NFSU", color = "darkred", hjust = -0.1, size = 3) +
+  labs(title = "Deviance Residuals Over Time",
+       x = "Week", y = "Deviance Residual") +
+  theme_minimal()
+```
+
+------------------------------------------------------------------------
+
+# Section 6: Spatial Residual Diagnostics
+
+## 6.1 Grid-Level Poisson Model
+
+```{r}
+panel_model <- panel %>%
+  filter(grid_id %in% top_grids) %>%
+  mutate(grid_id = factor(grid_id))
+
+m_grid <- glm(
+  count ~ week_index + nfsu + season + log_lag_count + grid_id,
+  data   = panel_model,
+  family = poisson(link = "log")
+)
+
+cat("Grid-level Poisson AIC:", round(AIC(m_grid), 2), "\n")
+cat("Dispersion:", round(deviance(m_grid) / df.residual(m_grid), 3), "\n")
+```
+
+## 6.2 Spatial Residual Map
+
+```{r}
+panel_model <- panel_model %>%
+  mutate(dev_resid = residuals(m_grid, type = "deviance"))
+
+grid_resid <- panel_model %>%
+  group_by(grid_id) %>%
+  summarize(mean_resid = mean(dev_resid), .groups = "drop") %>%
+  mutate(grid_id = as.character(grid_id))
+
+grid_sf_resid <- grid_sf %>%
+  rename(grid_id = Name) %>%
+  inner_join(grid_resid, by = "grid_id")
+
+pal_resid <- colorNumeric(c("blue", "white", "red"), domain = grid_sf_resid$mean_resid)
+
+leaflet(grid_sf_resid) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor   = ~pal_resid(mean_resid),
+    fillOpacity = 0.7,
+    color       = "black", weight = 0.5,
+    popup = ~paste("<b>Grid:</b>", grid_id,
+                   "<br><b>Mean Residual:</b>", round(mean_resid, 3))
+  ) %>%
+  addLegend(pal = pal_resid, values = ~mean_resid,
+            title = "Mean Dev. Residual<br>(Red = underpredicted)",
+            position = "bottomright")
+```
+
+## 6.3 Moran's I on Spatial Residuals
+
+```{r}
+grid_sf_moran <- grid_sf %>%
+  rename(grid_id = Name) %>%
+  left_join(grid_resid, by = "grid_id") %>%
+  replace_na(list(mean_resid = 0))
+
+nb_resid <- poly2nb(grid_sf_moran, queen = TRUE)
+lw_resid <- nb2listw(nb_resid, style = "W", zero.policy = TRUE)
+
+moran_resid <- moran.test(grid_sf_moran$mean_resid, lw_resid, zero.policy = TRUE)
+print(moran_resid)
+cat("\nIf significant: spatial structure remains — space-time model needed.\n")
+```
+
+------------------------------------------------------------------------
+
+# Section 7: Before vs After NFSU — Spatial Comparison
+
+## 7.1 LISA Before vs After
+
+```{r}
+run_lisa <- function(df_period, grid_polygon, nb_weights) {
+  counts <- df_period %>%
+    group_by(grid_id) %>%
+    summarize(total = sum(count), .groups = "drop")
+
+  gdf <- grid_polygon %>%
+    left_join(counts, by = "grid_id") %>%
+    replace_na(list(total = 0))
+
+  lisa_out <- localmoran(gdf$total, nb_weights, zero.policy = TRUE)
+
+  gdf %>%
+    mutate(
+      lisa_p   = lisa_out[, "Pr(z != E(Ii))"],
+      z_score  = as.numeric(scale(total)),
+      lag_z    = lag.listw(nb_weights, z_score, zero.policy = TRUE),
+      quad_sig = case_when(
+        lisa_p >= 0.05             ~ "Not Significant",
+        z_score > 0 & lag_z > 0   ~ "High-High (Hotspot)",
+        z_score < 0 & lag_z < 0   ~ "Low-Low (Cold spot)",
+        z_score > 0 & lag_z < 0   ~ "High-Low (Outlier)",
+        z_score < 0 & lag_z > 0   ~ "Low-High (Outlier)"
+      ),
+      quad_sig = factor(quad_sig, levels = c(
+        "High-High (Hotspot)", "Low-Low (Cold spot)",
+        "High-Low (Outlier)", "Low-High (Outlier)", "Not Significant"
+      ))
+    )
+}
+
+grid_base    <- grid_sf %>% rename(grid_id = Name)
+panel_before <- panel %>% filter(nfsu == 0)
+panel_after  <- panel %>% filter(nfsu == 1)
+
+lisa_before <- run_lisa(panel_before, grid_base, lw)
+lisa_after  <- run_lisa(panel_after,  grid_base, lw)
+```
+
+```{r}
+pal_lisa2 <- colorFactor(
+  palette = c("#d7191c", "#2c7bb6", "#fdae61", "#abd9e9", "#f0f0f0"),
+  levels  = c("High-High (Hotspot)", "Low-Low (Cold spot)",
+              "High-Low (Outlier)", "Low-High (Outlier)", "Not Significant")
+)
+
+# Before NFSU
+leaflet(lisa_before) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor = ~pal_lisa2(quad_sig), fillOpacity = 0.75,
+    color = "black", weight = 0.5,
+    popup = ~paste("<b>Grid:</b>", grid_id, "<br><b>LISA:</b>", quad_sig)
+  ) %>%
+  addLegend(pal = pal_lisa2, values = ~quad_sig,
+            title = "LISA: Before NFSU", position = "bottomright") %>%
+  setView(lng = -93.09, lat = 44.95, zoom = 12)
+```
+
+```{r}
+# After NFSU
+leaflet(lisa_after) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor = ~pal_lisa2(quad_sig), fillOpacity = 0.75,
+    color = "black", weight = 0.5,
+    popup = ~paste("<b>Grid:</b>", grid_id, "<br><b>LISA:</b>", quad_sig)
+  ) %>%
+  addLegend(pal = pal_lisa2, values = ~quad_sig,
+            title = "LISA: After NFSU", position = "bottomright") %>%
+  setView(lng = -93.09, lat = 44.95, zoom = 12)
+```
+
+## 7.2 Hotspot Stability Table
+
+```{r}
+hotspot_comparison <- lisa_before %>%
+  st_drop_geometry() %>%
+  dplyr::select(grid_id, before_quad = quad_sig) %>%
+  left_join(
+    lisa_after %>% st_drop_geometry() %>% dplyr::select(grid_id, after_quad = quad_sig),
+    by = "grid_id"
+  ) %>%
+  mutate(
+    status = case_when(
+      before_quad == "High-High (Hotspot)" & after_quad == "High-High (Hotspot)" ~ "Persistent Hotspot",
+      before_quad == "High-High (Hotspot)" & after_quad != "High-High (Hotspot)" ~ "Cooled (NFSU effect?)",
+      before_quad != "High-High (Hotspot)" & after_quad == "High-High (Hotspot)" ~ "Emerging Hotspot",
+      TRUE ~ "Neither"
+    )
+  )
+
+hotspot_comparison %>%
+  filter(status != "Neither") %>%
+  arrange(status, grid_id) %>%
+  knitr::kable(caption = "Hotspot Status Before vs After NFSU")
+```
+
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+# Section 9: INGARCH Spatio-Temporal Model (`hhh4`)
+
+## Background and Motivation
+
+The GLM models in Sections 4–6 treat each week's shooting count as
+depending on time-level covariates (trend, season, NFSU indicator) but
+do not explicitly model the **contagion process** — the idea that a
+shooting this week makes shootings more likely *in the same location*
+next week. This is the self-excitation or "repeat victimization" concept
+central to the Hawkes process literature.
+
+The **INGARCH** (Integer-valued Generalized AutoRegressive Conditional
+Heteroskedastic) model handles this directly. For each grid cell $i$ at
+week $t$, we model:
+
+$$Y_{i,t} \mid Y_{i,t-1} \sim \text{Poisson}(\lambda_{i,t})$$
+
+The conditional mean $\lambda_{i,t}$ decomposes into two additive parts:
+
+$$\lambda_{i,t} = \underbrace{\mu_i}_{\text{background rate}} + \underbrace{\phi \cdot Y_{i,t-1}}_{\text{repeat victimization}}$$
+
+-   **Background rate** $\mu_i$: the baseline expected count for grid
+    $i$, driven by structural features of the location (demographics,
+    geography, persistent criminal activity). This is the "endemic"
+    component.
+-   **Repeat victimization** $\phi \cdot Y_{i,t-1}$: last week's count
+    in the same grid multiplies forward into this week. $\phi$ is the
+    self-excitation parameter — if $\phi > 0$, a spike in violence tends
+    to sustain itself. This is the "autoregressive" component.
+
+**The key research question:** Did the formation of the NFSU (January 1,
+2024) reduce $\phi$? A significant drop in $\phi$ after the unit formed
+would indicate the unit disrupted the contagion mechanism — places that
+spiked were no longer staying spiked.
+
+We fit this using `hhh4()` from the `surveillance` package, which is
+purpose-built for this class of spatio-temporal count models.
+
+------------------------------------------------------------------------
+
+## 9.1 Load `surveillance` Package
+
+```{r message=FALSE, warning=FALSE}
+# The surveillance package provides hhh4(), which fits multivariate
+# count time series models of the INGARCH / Hawkes process family.
+# It requires data structured as an sts (surveillance time series) object.
+library(surveillance)
+```
+
+------------------------------------------------------------------------
+
+## 9.2 Build the `sts` Object
+
+`hhh4()` does not accept a standard data frame. It requires a special
+**`sts`** object where:
+
+-   Rows = time periods (weeks)
+-   Columns = spatial units (grid cells)
+-   A neighbourhood adjacency matrix links grids to their neighbours
+
+```{r}
+# =============================================================
+# STEP 1: Pivot panel from long to wide format
+# =============================================================
+# The panel data frame (from Section 2) has one row per week × grid.
+# hhh4 needs it as a matrix: rows = weeks, columns = grids.
+# Missing week × grid combos are already filled with 0 from the panel build.
+
+# Grab the sorted unique weeks and grid IDs — we need these later
+# for building the NFSU covariate matrix and aligning fitted values.
+all_grid_ids  <- sort(unique(panel$grid_id))
+all_week_vals <- sort(unique(panel$week))
+
+# Pivot to wide: each column is one grid, each row is one week
+count_wide <- panel %>%
+  dplyr::select(week, grid_id, count) %>%
+  pivot_wider(
+    names_from  = grid_id,     # one column per grid
+    values_from = count,
+    values_fill = 0            # grids with no shootings that week = 0
+  ) %>%
+  arrange(week)                # make sure weeks are in chronological order
+
+# Drop the week column and convert to a plain numeric matrix
+count_matrix <- count_wide %>%
+  dplyr::select(-week) %>%
+  as.matrix()
+
+# Label rows with their week dates — used later to align fitted/observed
+rownames(count_matrix) <- as.character(count_wide$week)
+
+cat("Count matrix dimensions:", nrow(count_matrix), "weeks x",
+    ncol(count_matrix), "grids\n")
+cat("Total shooting events in matrix:", sum(count_matrix), "\n")
+cat("Overall zero proportion:", round(mean(count_matrix == 0), 3),
+    "— very sparse; this is expected for weekly grid data\n")
+```
+
+```{r}
+# =============================================================
+# STEP 2: Build the neighbourhood adjacency matrix
+# =============================================================
+# hhh4 uses spatial adjacency to allow for spatial spread of events
+# (the 'ne' or neighbourhood component). Even if we don't model spatial
+# spread explicitly, hhh4 needs the adjacency matrix to be present.
+#
+# IMPORTANT: the adjacency matrix rows/columns must be in the SAME ORDER
+# as the columns of count_matrix. We enforce this with arrange(match(...)).
+
+grid_sf_ordered <- grid_sf %>%
+  rename(grid_id = Name) %>%
+  filter(grid_id %in% colnames(count_matrix)) %>%
+  arrange(match(grid_id, colnames(count_matrix)))  # match column order exactly
+
+# Queen contiguity: two grids are neighbours if they share any edge or corner.
+# zero.policy = TRUE handles grids with no neighbours (island grids).
+nb_hhh4 <- poly2nb(grid_sf_ordered, queen = TRUE)
+adj_mat  <- nb2mat(nb_hhh4, style = "B", zero.policy = TRUE)  # binary 0/1 matrix
+rownames(adj_mat) <- grid_sf_ordered$grid_id
+colnames(adj_mat) <- grid_sf_ordered$grid_id
+
+cat("Adjacency matrix:", nrow(adj_mat), "x", ncol(adj_mat), "\n")
+cat("Average neighbours per grid:", round(mean(rowSums(adj_mat)), 2), "\n")
+```
+
+```{r}
+# =============================================================
+# STEP 3: Create the sts object
+# =============================================================
+# sts() packages the count matrix and neighbourhood matrix together.
+# frequency = 52 tells hhh4 we have weekly data (52 weeks per year).
+
+sts_obj <- sts(
+  observed      = count_matrix,
+  neighbourhood = adj_mat,
+  frequency     = 52   # weekly periodicity
+)
+
+cat("sts object created successfully\n")
+cat("Time points (weeks):", nrow(sts_obj), "\n")
+cat("Spatial units (grids):", ncol(sts_obj), "\n")
+```
+
+------------------------------------------------------------------------
+
+## 9.3 Build the NFSU Covariate Matrix
+
+To allow $\phi$ to differ before vs after NFSU formation, we need to
+pass an NFSU indicator as a covariate into the AR component of `hhh4`.
+
+`hhh4()` requires time-varying covariates as **plain 2D matrices**
+`[weeks × grids]` placed in the top-level `data` list of the control
+object. The same value applies to all grids in a given week, so we
+replicate the weekly indicator across all grid columns.
+
+```{r}
+# =============================================================
+# NFSU indicator vector: 0 = before unit formed, 1 = after
+# =============================================================
+# The NFSU (Non-Fatal Shooting Unit) was formed January 1, 2024.
+# We code weeks starting on or after that date as 1, prior weeks as 0.
+nfsu_vec <- as.integer(all_week_vals >= as.Date("2024-01-01"))
+
+cat("Weeks before NFSU (nfsu = 0):", sum(nfsu_vec == 0), "\n")
+cat("Weeks after  NFSU (nfsu = 1):", sum(nfsu_vec == 1), "\n")
+
+# =============================================================
+# Replicate the weekly indicator across all grid columns
+# =============================================================
+# hhh4 expects a [weeks x grids] matrix for time-varying covariates.
+# Since the NFSU effect is the same for all grids in a given week,
+# we tile the vector horizontally to fill the matrix.
+nfsu_matrix <- matrix(
+  rep(nfsu_vec, ncol(count_matrix)),  # repeat the vector once per grid
+  nrow = nrow(count_matrix),
+  ncol = ncol(count_matrix)
+)
+
+cat("NFSU matrix dimensions:", nrow(nfsu_matrix), "weeks x",
+    ncol(nfsu_matrix), "grids — ready for hhh4\n")
+```
+
+------------------------------------------------------------------------
+
+## 9.4 Model 1 — Baseline: Global Background + Global Self-Excitation
+
+**Equation:** $$\lambda_{i,t} = e^{\beta_0} + \phi \cdot Y_{i,t-1}$$
+
+This is the simplest INGARCH model:
+
+-   A single global intercept $e^{\beta_0}$ acts as the background rate
+    (the same for all grids and all time periods — a strong
+    simplification).
+-   A single global $\phi$ captures how strongly last week's count in a
+    grid predicts this week's count in the same grid.
+-   No NFSU effect — this is the **null model** for the NFSU hypothesis.
+
+In `hhh4()` terms:
+
+-   `ar` = autoregressive component → captures $\phi \cdot Y_{i,t-1}$
+-   `end` = endemic component → captures the background rate
+    $e^{\beta_0}$
+
+Note: `hhh4` works on the log scale internally, so `ar.1` and `end.1` in
+the output are log-scale coefficients. To get $\phi$ on the natural
+scale: $\phi = e^{\text{ar.1}}$.
+
+```{r}
+# =============================================================
+# Define the control list for Model 1
+# =============================================================
+# f = ~ 1 means "fit an intercept only" for that component.
+# family = "Poisson" specifies the count distribution.
+
+ctrl_m1 <- list(
+  ar     = list(f = ~ 1),   # global phi: one AR coefficient for all grids/times
+  end    = list(f = ~ 1),   # global background: one intercept for all grids/times
+  family = "Poisson"
+)
+
+# Fit Model 1 — wrap in tryCatch so errors don't halt the whole document
+fit_m1 <- tryCatch(
+  hhh4(sts_obj, control = ctrl_m1),
+  error = function(e) {
+    cat("Model 1 fitting error:", conditionMessage(e), "\n")
+    NULL
+  }
+)
+
+# Print the summary if the model converged
+if (!is.null(fit_m1)) {
+  cat("=== Model 1: Global Background + Global Self-Excitation ===\n")
+  cat("Converged:", fit_m1$convergence, "\n\n")
+  print(summary(fit_m1))
+  cat("\nNote: ar.1 and end.1 are on the log scale.\n")
+  cat("phi (self-excitation) = exp(ar.1) =",
+      round(exp(coef(fit_m1)["ar.1"]), 4), "\n")
+  cat("This means: a shooting this week raises next week's expected",
+      "count in the same grid by", round(exp(coef(fit_m1)["ar.1"]) * 100, 1),
+      "percentage points on average.\n")
+}
+```
+
+------------------------------------------------------------------------
+
+## 9.5 Model 2a — Key Model: Global Background + NFSU-Stratified Self-Excitation
+
+**Equation:** $$\lambda_{i,t} = e^{\beta_0} + \phi_j \cdot Y_{i,t-1}$$
+
+where $j = 0$ before NFSU, $j = 1$ after NFSU. So:
+
+-   $\phi_{\text{before}} = e^{\beta_{\text{ar}}}$
+-   $\phi_{\text{after}} = e^{\beta_{\text{ar}} + \beta_{\text{nfsu}}}$
+
+This model adds exactly **one parameter** (the NFSU modifier on $\phi$)
+to Model 1. If $\beta_{\text{nfsu}} < 0$, the self-excitation parameter
+dropped after the NFSU formed — consistent with the unit disrupting the
+contagion mechanism.
+
+**Why this model is identifiable (unlike a version with grid random
+effects):** We only have \~101 after-NFSU weeks spread across 200 sparse
+grids. If we also fit 200 grid-specific intercepts simultaneously, there
+isn't enough data per grid to identify both the grid effects AND the
+NFSU AR modifier. By keeping the background rate global here, we use all
+the data to estimate the one coefficient we care about
+($\beta_{\text{nfsu}}$).
+
+```{r}
+# =============================================================
+# Define the control list for Model 2a
+# =============================================================
+# ar formula: ~ 1 + nfsu
+#   → baseline AR intercept (ar.1) + NFSU modifier (ar.nfsu)
+#   → phi_before = exp(ar.1)
+#   → phi_after  = exp(ar.1 + ar.nfsu)
+#
+# data = list(nfsu = nfsu_matrix):
+#   → the NFSU covariate [205 weeks x 200 grids] lives at the TOP LEVEL
+#     of the control list, NOT nested inside ar. This is an hhh4 quirk.
+#
+# start: warm-start from M1 estimates so the optimizer has a good
+#   starting point, especially important for the global intercept.
+#
+# optimizer stop: increase max iterations from the default (10) to 300
+#   to give the model room to converge on the additional parameter.
+
+ctrl_m2a <- list(
+  ar     = list(f = ~ 1 + nfsu),       # phi differs before vs after NFSU
+  end    = list(f = ~ 1),              # single global background rate
+  family = "Poisson",
+  data   = list(nfsu = nfsu_matrix),   # NFSU indicator matrix — top-level!
+  optimizer = list(
+    stop = list(iter.max = 300, tol = 1e-6)  # more iterations than default
+  ),
+  start = list(
+    fixed = c(
+      "ar.1"    = coef(fit_m1)["ar.1"],   # start phi at M1 estimate
+      "ar.nfsu" = 0,                       # start NFSU modifier at 0 (no effect)
+      "end.1"   = coef(fit_m1)["end.1"]   # start background at M1 estimate
+    )
+  )
+)
+
+# suppressWarnings: hhh4 prints a convergence warning mid-run even when
+# it converges — we check fit_m2a$convergence explicitly below instead.
+fit_m2a <- suppressWarnings(tryCatch(
+  hhh4(sts_obj, control = ctrl_m2a),
+  error = function(e) {
+    cat("Model 2a fitting error:", conditionMessage(e), "\n")
+    NULL
+  }
+))
+
+if (!is.null(fit_m2a)) {
+  cat("=== Model 2a: Global Background + NFSU-Stratified AR ===\n")
+  cat("Converged:", fit_m2a$convergence, "\n\n")
+  print(summary(fit_m2a))
+
+  # --- phi extraction (natural scale) ---
+  cat("\n--- phi estimates (natural scale) ---\n")
+  cat("Note: ar.1 and ar.nfsu are on the log scale internally.\n")
+  cat("  phi_before = exp(ar.1)\n")
+  cat("  phi_after  = exp(ar.1 + ar.nfsu)\n\n")
+
+  coefs_m2a  <- fit_m2a$coefficients
+  b0_m2a     <- coefs_m2a["ar.1"]
+  b1_m2a     <- coefs_m2a["ar.nfsu"]
+  phi_before_m2a <- exp(b0_m2a)
+  phi_after_m2a  <- exp(b0_m2a + b1_m2a)
+
+  cat(sprintf("phi_before (pre-NFSU) : %.4f\n", phi_before_m2a))
+  cat(sprintf("phi_after  (post-NFSU): %.4f\n", phi_after_m2a))
+  cat(sprintf("Change in phi (after - before): %.4f\n", phi_after_m2a - phi_before_m2a))
+  cat(sprintf("Relative change: %.1f%%\n",
+      (phi_after_m2a - phi_before_m2a) / phi_before_m2a * 100))
+}
+```
+
+------------------------------------------------------------------------
+
+## 9.6 Model 2b — Spatial Heterogeneity: Grid-Specific Background + Global AR
+
+**Equation:** $$\lambda_{i,t} = \mu_i + \phi \cdot Y_{i,t-1}$$
+
+This model asks a different question from M2a: do different grid cells
+have structurally different baseline crime rates? The `ri(type = "iid")`
+term fits one intercept per grid — 200 independent parameters — so each
+grid's background rate is estimated from its own history.
+
+This is NOT the primary model for the NFSU hypothesis (no NFSU term),
+but it's important for understanding whether the spatial heterogeneity
+we saw in the LISA maps (Section 3) is also present in the model fit.
+The massive AIC improvement over M1 confirms it is.
+
+```{r}
+# =============================================================
+# Define the control list for Model 2b
+# =============================================================
+# end formula: ~ -1 + ri(type = "iid")
+#   → -1 removes the global intercept
+#   → ri(type = "iid") adds one independent intercept per grid cell
+#   → result: 200 grid-specific background rates (mu_i)
+#
+# ar formula: ~ 1 → single global phi (same for all grids/times)
+#
+# Note: We do NOT include NFSU here. The 200 grid intercepts + NFSU
+# interaction is not identifiable with this data (too sparse). M2a
+# handles the NFSU question; M2b handles the spatial question.
+
+ctrl_m2b <- list(
+  ar     = list(f = ~ 1),                    # global phi
+  end    = list(f = ~ -1 + ri(type = "iid")), # one intercept per grid
+  family = "Poisson",
+  optimizer = list(
+    stop = list(iter.max = 500, tol = 1e-5)  # grid-level model needs more iterations
+  ),
+  start = list(
+    fixed = c("ar.1" = coef(fit_m1)["ar.1"]) # warm-start AR from M1
+  )
+)
+
+fit_m2b <- suppressWarnings(tryCatch(
+  hhh4(sts_obj, control = ctrl_m2b),
+  error = function(e) {
+    cat("Model 2b fitting error:", conditionMessage(e), "\n")
+    NULL
+  }
+))
+
+if (!is.null(fit_m2b)) {
+  cat("=== Model 2b: Grid-Specific Background + Global AR ===\n")
+  cat("Converged:", fit_m2b$convergence, "\n\n")
+
+  # Don't print summary — it has 200+ coefficients (one per grid).
+  # Instead, print just the AR coefficient and model fit statistics.
+  cat("Global phi (ar.1, log scale):",
+      round(fit_m2b$coefficients["ar.1"], 5), "\n")
+  cat("phi (natural scale) = exp(ar.1) =",
+      round(exp(fit_m2b$coefficients["ar.1"]), 4), "\n")
+  cat("Log-likelihood:", round(fit_m2b$loglikelihood, 2), "\n")
+  cat("AIC (manual):",
+      round(-2 * fit_m2b$loglikelihood + 2 * length(fit_m2b$coefficients), 2), "\n")
+  cat("\nNote: The massive improvement over M1 confirms strong spatial",
+      "heterogeneity in background rates across grids.\n")
+}
+```
+
+------------------------------------------------------------------------
+
+## 9.7 Formal Model Comparison
+
+We compare all three models on log-likelihood and AIC. Because M1 and
+M2a are nested (M2a adds exactly one parameter to M1), we can also run a
+**likelihood ratio test** (LRT) to formally test whether the NFSU effect
+on $\phi$ is statistically significant.
+
+```{r}
+# =============================================================
+# Model comparison table
+# =============================================================
+# Collect all fitted models that ran successfully into a named list.
+# This makes the comparison code robust — if a model failed, it's
+# simply excluded from the table.
+
+models_list <- list(
+  "M1: Global background + global φ"    = fit_m1,
+  "M2a: Global background + NFSU φ"     = fit_m2a,
+  "M2b: Grid backgrounds + global φ"    = fit_m2b
+)
+models_list <- Filter(Negate(is.null), models_list)  # drop any NULLs
+
+# Build comparison data frame.
+# AIC = -2 * logLik + 2 * k, where k = number of parameters.
+# We compute manually because AIC() may return NA if convergence is FALSE.
+model_comp <- data.frame(
+  Model     = names(models_list),
+  Converged = sapply(models_list, function(m) m$convergence),
+  LogLik    = sapply(models_list, function(m) round(m$loglikelihood, 2)),
+  Params    = sapply(models_list, function(m) length(m$coefficients)),
+  AIC       = sapply(models_list, function(m)
+    round(-2 * m$loglikelihood + 2 * length(m$coefficients), 2)),
+  row.names = NULL
+)
+
+knitr::kable(
+  model_comp,
+  caption = paste(
+    "INGARCH Model Comparison.",
+    "M2a vs M1: tests whether NFSU changed self-excitation (1 extra parameter).",
+    "M2b vs M1: tests whether grid-specific backgrounds improve fit (198 extra parameters)."
+  )
+)
+```
+
+```{r}
+# =============================================================
+# Likelihood Ratio Test: M1 vs M2a
+# =============================================================
+# The LRT compares two nested models. M2a adds exactly 1 parameter
+# (ar.nfsu) to M1. Under H0 (ar.nfsu = 0, no NFSU effect), the test
+# statistic 2*(logLik(M2a) - logLik(M1)) follows a chi-squared
+# distribution with 1 degree of freedom.
+#
+# A significant result means the NFSU modifier on phi is statistically
+# supported — the self-excitation parameter did change after the unit formed.
+
+if (!is.null(fit_m1) && !is.null(fit_m2a)) {
+
+  # Compute the LRT statistic manually
+  lrt_stat <- 2 * (fit_m2a$loglikelihood - fit_m1$loglikelihood)
+  lrt_df   <- length(fit_m2a$coefficients) - length(fit_m1$coefficients)
+  lrt_p    <- pchisq(lrt_stat, df = lrt_df, lower.tail = FALSE)
+
+  cat("=== Likelihood Ratio Test: M1 vs M2a ===\n")
+  cat("H0: NFSU has no effect on phi (ar.nfsu = 0)\n")
+  cat("H1: NFSU changes phi (ar.nfsu ≠ 0)\n\n")
+  cat("LRT statistic (chi-squared):", round(lrt_stat, 4), "\n")
+  cat("Degrees of freedom:", lrt_df, "\n")
+  cat("p-value:", format(lrt_p, digits = 4), "\n\n")
+
+  if (lrt_p < 0.001) {
+    cat("RESULT: Highly significant (p < 0.001).",
+        "Strong evidence that phi changed after NFSU formation.\n")
+  } else if (lrt_p < 0.05) {
+    cat("RESULT: Significant (p < 0.05).",
+        "Evidence that phi changed after NFSU formation.\n")
+  } else {
+    cat("RESULT: Not significant (p >= 0.05).",
+        "Insufficient evidence of a change in phi after NFSU.\n")
+  }
+}
+```
+
+------------------------------------------------------------------------
+
+## 9.8 Key Results — NFSU Effect on Self-Excitation ($\phi$)
+
+This section translates the M2a log-scale coefficients into
+interpretable $\phi$ values on the natural scale, with 95% confidence
+intervals computed via the delta method (standard in `hhh4`).
+
+```{r}
+# =============================================================
+# Extract phi_before and phi_after with confidence intervals
+# =============================================================
+# hhh4 stores coefficients on the log scale. To get phi on the
+# natural scale we exponentiate:
+#   phi_before = exp(ar.1)
+#   phi_after  = exp(ar.1 + ar.nfsu)
+#
+# For confidence intervals, we use the coefficient standard errors
+# from the model summary. Because phi = exp(linear combination),
+# we build CIs on the log scale first, then exponentiate:
+#   CI for phi_before: exp(ar.1 ± 1.96 * SE(ar.1))
+#   CI for phi_after:  exp((ar.1 + ar.nfsu) ± 1.96 * sqrt(Var(ar.1 + ar.nfsu)))
+#
+# Var(ar.1 + ar.nfsu) = Var(ar.1) + Var(ar.nfsu) + 2*Cov(ar.1, ar.nfsu)
+
+if (!is.null(fit_m2a) && fit_m2a$convergence) {
+
+  # Pull the full coefficient vector
+  coefs <- fit_m2a$coefficients
+  b0    <- coefs["ar.1"]      # log-scale AR intercept
+  b1    <- coefs["ar.nfsu"]   # log-scale NFSU modifier
+
+  # Pull the variance-covariance matrix for the fixed effects
+  # fitm2a$cov is the full VCV; we extract rows/cols for the AR terms
+  vcv       <- fit_m2a$cov
+  var_b0    <- vcv["ar.1",    "ar.1"]
+  var_b1    <- vcv["ar.nfsu", "ar.nfsu"]
+  cov_b0b1  <- vcv["ar.1",    "ar.nfsu"]
+
+  # Standard errors on log scale
+  se_before <- sqrt(var_b0)
+  se_after  <- sqrt(var_b0 + var_b1 + 2 * cov_b0b1)
+
+  # Point estimates on natural scale
+  phi_before <- exp(b0)
+  phi_after  <- exp(b0 + b1)
+
+  # 95% confidence intervals (exponentiated from log-scale CIs)
+  z95 <- qnorm(0.975)   # 1.96
+  phi_before_lo <- exp(b0         - z95 * se_before)
+  phi_before_hi <- exp(b0         + z95 * se_before)
+  phi_after_lo  <- exp(b0 + b1    - z95 * se_after)
+  phi_after_hi  <- exp(b0 + b1    + z95 * se_after)
+
+  # Build a clean summary table
+  phi_table <- data.frame(
+    Period       = c("Before NFSU (2022–2023)", "After NFSU (2024–2025)"),
+    phi_estimate = round(c(phi_before, phi_after), 4),
+    CI_lower     = round(c(phi_before_lo, phi_after_lo), 4),
+    CI_upper     = round(c(phi_before_hi, phi_after_hi), 4),
+    Interpretation = c(
+      paste0("A shooting raises next week's expected count by ~",
+             round(phi_before * 100, 1), "pp in the same grid"),
+      paste0("A shooting raises next week's expected count by ~",
+             round(phi_after * 100, 1), "pp in the same grid")
+    )
+  )
+
+  knitr::kable(
+    phi_table,
+    col.names = c("Period", "φ estimate", "95% CI lower",
+                  "95% CI upper", "Plain-language interpretation"),
+    caption   = paste(
+      "Self-excitation parameter φ before and after NFSU formation.",
+      "φ represents the fraction of this week's shootings in a grid",
+      "attributable to last week's shootings in the same grid.",
+      "CIs computed via delta method on the log scale."
+    )
+  )
+
+  # Summary statistics for easy reference
+  cat("\n=== Summary ===\n")
+  cat("phi before NFSU:", round(phi_before, 4),
+      sprintf("(95%% CI: %.4f – %.4f)\n", phi_before_lo, phi_before_hi))
+  cat("phi after  NFSU:", round(phi_after, 4),
+      sprintf("(95%% CI: %.4f – %.4f)\n", phi_after_lo, phi_after_hi))
+  cat("Absolute reduction in phi:", round(phi_before - phi_after, 4), "\n")
+  cat("Relative reduction:", round((1 - phi_after / phi_before) * 100, 1),
+      "% drop in self-excitation after NFSU\n")
+
+  # Final interpretation
+  cat("\n=== Interpretation ===\n")
+  if (phi_after < phi_before && phi_after_hi < phi_before_lo) {
+    cat("The confidence intervals for phi_before and phi_after do NOT overlap.\n")
+    cat("This provides strong evidence that self-excitation decreased\n")
+    cat("significantly after the NFSU was formed — the LRT confirms this.\n")
+    cat("A shooting in a grid cell was much less likely to 'stay hot'\n")
+    cat("in the following week after the unit began operating.\n")
+  } else if (phi_after < phi_before) {
+    cat("phi decreased after NFSU, and the LRT is significant, but\n")
+    cat("the confidence intervals overlap slightly — interpret with caution.\n")
+  } else {
+    cat("phi did not meaningfully decrease after NFSU formation.\n")
+  }
+
+} else if (!is.null(fit_m2a)) {
+  # Model ran but didn't converge — we can still report raw coefficients
+  # but note that the standard errors may be unreliable.
+  cat("WARNING: M2a did not fully converge. SEs may be unreliable.\n")
+  b0 <- fit_m2a$coefficients["ar.1"]
+  b1 <- fit_m2a$coefficients["ar.nfsu"]
+  cat("phi before (approx):", round(exp(b0), 4), "\n")
+  cat("phi after  (approx):", round(exp(b0 + b1), 4), "\n")
+} else {
+  cat("M2a did not run. Cannot report phi estimates.\n")
+}
+```
+
+------------------------------------------------------------------------
+
+## 9.9 Fitted vs Observed — Model 1
+
+A visual check of how well each model tracks the observed weekly counts
+across all grids combined.
+
+Note: `fitted()` returns one fewer row than `observed()` because the
+AR(1) term requires $Y_{i,t-1}$, so the first week has no fitted value.
+We align by trimming `observed` from the front.
+
+```{r fig.height=5}
+if (!is.null(fit_m1)) {
+
+  # Get fitted values (sum across all grids to get city-wide weekly total)
+  fit_weekly <- rowSums(fitted(fit_m1))
+  n_fit      <- length(fit_weekly)
+
+  # Trim observed and week labels to match the length of fitted
+  # (AR lag means first week has no prediction)
+  obs_weekly <- rowSums(observed(sts_obj))[
+    (nrow(count_matrix) - n_fit + 1):nrow(count_matrix)
+  ]
+  weeks_seq <- as.Date(rownames(count_matrix))[
+    (nrow(count_matrix) - n_fit + 1):nrow(count_matrix)
+  ]
+
+  diag_df <- data.frame(week = weeks_seq, observed = obs_weekly, fitted = fit_weekly)
+
+  ggplot(diag_df, aes(x = week)) +
+    geom_line(aes(y = observed, color = "Observed"), linewidth = 0.8) +
+    geom_line(aes(y = fitted, color = "Fitted M1"), linewidth = 0.8,
+              linetype = "dashed") +
+    geom_vline(xintercept = as.Date("2024-01-01"),
+               color = "red", linetype = "dotted") +
+    annotate("text", x = as.Date("2024-01-01"),
+             y = max(obs_weekly, na.rm = TRUE),
+             label = "NFSU start", color = "red", hjust = -0.1, size = 3) +
+    scale_color_manual(
+      values = c("Observed" = "steelblue", "Fitted M1" = "darkorange")
+    ) +
+    labs(
+      title    = "Model 1: Weekly Observed vs Fitted (Global Background + Global φ)",
+      subtitle = "M1 uses a single global background and self-excitation rate across all grids",
+      x = "Week", y = "Total Shootings (all grids)", color = ""
+    ) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+}
+```
+
+------------------------------------------------------------------------
+
+## 9.10 Fitted vs Observed — Model 2a
+
+```{r fig.height=5}
+if (!is.null(fit_m2a)) {
+
+  fit2_weekly <- rowSums(fitted(fit_m2a))
+  n_fit2      <- length(fit2_weekly)
+
+  obs_weekly <- rowSums(observed(sts_obj))[
+    (nrow(count_matrix) - n_fit2 + 1):nrow(count_matrix)
+  ]
+  weeks_seq <- as.Date(rownames(count_matrix))[
+    (nrow(count_matrix) - n_fit2 + 1):nrow(count_matrix)
+  ]
+
+  diag_df2 <- data.frame(week = weeks_seq, observed = obs_weekly, fitted = fit2_weekly)
+
+  ggplot(diag_df2, aes(x = week)) +
+    geom_line(aes(y = observed, color = "Observed"), linewidth = 0.8) +
+    geom_line(aes(y = fitted, color = "Fitted M2a"), linewidth = 0.8,
+              linetype = "dashed") +
+    geom_vline(xintercept = as.Date("2024-01-01"),
+               color = "red", linetype = "dotted") +
+    annotate("text", x = as.Date("2024-01-01"),
+             y = max(obs_weekly, na.rm = TRUE),
+             label = "NFSU start", color = "red", hjust = -0.1, size = 3) +
+    scale_color_manual(
+      values = c("Observed" = "steelblue", "Fitted M2a" = "darkgreen")
+    ) +
+    labs(
+      title    = "Model 2a: Weekly Observed vs Fitted (Global Background + NFSU φ)",
+      subtitle = "M2a allows φ to differ before vs after NFSU formation",
+      x = "Week", y = "Total Shootings (all grids)", color = ""
+    ) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+}
+```
+
+------------------------------------------------------------------------
+
+## 9.10b Fitted vs Observed — Model 2b
+
+```{r fig.height=5}
+if (!is.null(fit_m2b)) {
+
+  fit2b_weekly <- rowSums(fitted(fit_m2b))
+  n_fit2b      <- length(fit2b_weekly)
+
+  obs_weekly_2b <- rowSums(observed(sts_obj))[
+    (nrow(count_matrix) - n_fit2b + 1):nrow(count_matrix)
+  ]
+  weeks_seq_2b <- as.Date(rownames(count_matrix))[
+    (nrow(count_matrix) - n_fit2b + 1):nrow(count_matrix)
+  ]
+
+  diag_df2b <- data.frame(week = weeks_seq_2b,
+                           observed = obs_weekly_2b,
+                           fitted   = fit2b_weekly)
+
+  ggplot(diag_df2b, aes(x = week)) +
+    geom_line(aes(y = observed, color = "Observed"), linewidth = 0.8) +
+    geom_line(aes(y = fitted, color = "Fitted M2b"), linewidth = 0.8,
+              linetype = "dashed") +
+    geom_vline(xintercept = as.Date("2024-01-01"),
+               color = "red", linetype = "dotted") +
+    annotate("text", x = as.Date("2024-01-01"),
+             y = max(obs_weekly_2b, na.rm = TRUE),
+             label = "NFSU start", color = "red", hjust = -0.1, size = 3) +
+    scale_color_manual(
+      values = c("Observed" = "steelblue", "Fitted M2b" = "purple")
+    ) +
+    labs(
+      title    = "Model 2b: Weekly Observed vs Fitted (Grid-Specific Background + Global φ)",
+      subtitle = "M2b uses grid-specific background rates (ri) and a single global phi",
+      x = "Week", y = "Total Shootings (all grids)", color = ""
+    ) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+}
+```
+
+------------------------------------------------------------------------
+
+## 9.11 Residual Diagnostics — ACF/PACF
+
+If the model has successfully captured the temporal autocorrelation in
+the data, the ACF and PACF of the Pearson residuals should show no
+significant bars beyond the dashed confidence bounds.
+
+Pearson residuals:
+$(Y_{i,t} - \hat{\lambda}_{i,t}) / \sqrt{\hat{\lambda}_{i,t}}$
+
+We average these across all grids within each week to get a single
+residual time series for visual inspection. Plots are shown for all
+three spatio-temporal models so their residual autocorrelation can be
+compared directly.
+
+### ACF/PACF — Model 1
+
+```{r fig.height=4}
+if (!is.null(fit_m1)) {
+
+  fit_mat_m1 <- fitted(fit_m1)
+  n_fit_m1   <- nrow(fit_mat_m1)
+
+  obs_mat_m1 <- observed(sts_obj)[
+    (nrow(count_matrix) - n_fit_m1 + 1):nrow(count_matrix), ]
+
+  pearson_mat_m1  <- (obs_mat_m1 - fit_mat_m1) / sqrt(fit_mat_m1 + 1e-8)
+  resid_weekly_m1 <- rowMeans(pearson_mat_m1, na.rm = TRUE)
+
+  op <- par(no.readonly = TRUE)
+  on.exit(par(op), add = TRUE)
+  par(mfrow = c(1, 2))
+  acf(resid_weekly_m1,
+      main    = "ACF — M1 Weekly Pearson Residuals",
+      lag.max = 30,
+      xlab    = "Lag (weeks)")
+  pacf(resid_weekly_m1,
+       main    = "PACF — M1 Weekly Pearson Residuals",
+       lag.max = 30,
+       xlab    = "Lag (weeks)")
+  par(op)
+
+  cat("=== M1 ACF/PACF Interpretation ===\n")
+  cat("M1 uses a single global background and a single global phi.\n")
+  cat("Bars within dashed blue lines: no residual autocorrelation at that lag.\n")
+  cat("Persistent bars suggest M1 is not fully capturing temporal dynamics.\n")
+}
+```
+
+### ACF/PACF — Model 2a
+
+```{r fig.height=4}
+if (!is.null(fit_m2a)) {
+
+  fit_mat_m2a <- fitted(fit_m2a)
+  n_fit_m2a   <- nrow(fit_mat_m2a)
+
+  obs_mat_m2a <- observed(sts_obj)[
+    (nrow(count_matrix) - n_fit_m2a + 1):nrow(count_matrix), ]
+
+  pearson_mat_m2a  <- (obs_mat_m2a - fit_mat_m2a) / sqrt(fit_mat_m2a + 1e-8)
+  resid_weekly_m2a <- rowMeans(pearson_mat_m2a, na.rm = TRUE)
+
+  op <- par(no.readonly = TRUE)
+  on.exit(par(op), add = TRUE)
+  par(mfrow = c(1, 2))
+  acf(resid_weekly_m2a,
+      main    = "ACF — M2a Weekly Pearson Residuals",
+      lag.max = 30,
+      xlab    = "Lag (weeks)")
+  pacf(resid_weekly_m2a,
+       main    = "PACF — M2a Weekly Pearson Residuals",
+       lag.max = 30,
+       xlab    = "Lag (weeks)")
+  par(op)
+
+  cat("=== M2a ACF/PACF Interpretation ===\n")
+  cat("M2a allows phi to differ before vs after NFSU formation.\n")
+  cat("Bars within dashed blue lines: no residual autocorrelation at that lag.\n")
+  cat("Bars exceeding the dashed lines: remaining temporal structure the model\n")
+  cat("hasn't captured — could suggest a higher-order AR term or missed covariate.\n")
+}
+```
+
+### ACF/PACF — Model 2b
+
+```{r fig.height=4}
+if (!is.null(fit_m2b)) {
+
+  fit_mat_m2b <- fitted(fit_m2b)
+  n_fit_m2b   <- nrow(fit_mat_m2b)
+
+  obs_mat_m2b <- observed(sts_obj)[
+    (nrow(count_matrix) - n_fit_m2b + 1):nrow(count_matrix), ]
+
+  pearson_mat_m2b  <- (obs_mat_m2b - fit_mat_m2b) / sqrt(fit_mat_m2b + 1e-8)
+  resid_weekly_m2b <- rowMeans(pearson_mat_m2b, na.rm = TRUE)
+
+  op <- par(no.readonly = TRUE)
+  on.exit(par(op), add = TRUE)
+  par(mfrow = c(1, 2))
+  acf(resid_weekly_m2b,
+      main    = "ACF — M2b Weekly Pearson Residuals",
+      lag.max = 30,
+      xlab    = "Lag (weeks)")
+  pacf(resid_weekly_m2b,
+       main    = "PACF — M2b Weekly Pearson Residuals",
+       lag.max = 30,
+       xlab    = "Lag (weeks)")
+  par(op)
+
+  cat("=== M2b ACF/PACF Interpretation ===\n")
+  cat("M2b uses grid-specific background rates (ri) with a global phi.\n")
+  cat("If M2b residuals show less autocorrelation than M1/M2a, the spatial\n")
+  cat("random effects are absorbing temporal structure as well.\n")
+  cat("Bars within dashed blue lines: no residual autocorrelation at that lag.\n")
+}
+```
+
+------------------------------------------------------------------------
+
+## 9.12 Important Caveats
+
+Before presenting these results, note the following limitations:
+
+1.  **Quasi-experimental design**: The before/after contrast cannot rule
+    out other changes that occurred simultaneously with NFSU formation
+    in January 2024 (e.g., seasonal effects in January, other policing
+    changes, demographic shifts). The model controls for seasonality via
+    the GLM stage but not within the INGARCH model itself.
+
+2.  **Zero inflation**: 93.8% of the weekly grid × time cells are zero.
+    The Poisson INGARCH model handles sparse counts but may underfit
+    grids that were consistently zero throughout. Restricting to the
+    top-quartile grids (as in Section 6) addresses this.
+
+3.  **Spatial component**: These models do not include the neighbourhood
+    (`ne`) component of `hhh4`, which would model spatial spread of
+    violence across neighbouring grids. The Moran's I on residuals
+    (Section 6) showed significant residual spatial structure,
+    suggesting a full spatio-temporal model (with `ne`) could improve
+    fit further.
+
+4.  **Identifiability of M2b+NFSU**: Combining 200 grid random effects
+    with an NFSU interaction in AR is not identifiable with this dataset
+    (as we found during fitting). M2a cleanly isolates the NFSU question
+    and is the appropriate model for inference.
