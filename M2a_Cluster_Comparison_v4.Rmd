@@ -1,0 +1,1041 @@
+---
+title: "DASC 460: M2a vs Neighborhood-Cluster Background Model"
+subtitle: "Frogtown · Phalen (High-High) + Mac-Groveland/Highland (Low-Low) vs Global Background"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+------------------------------------------------------------------------
+
+# Setup
+
+```{r setup, warning=FALSE, message=FALSE}
+library(rmarkdown); library(knitr)
+library(readxl);    library(dplyr)
+library(ggplot2);   library(lubridate)
+library(tidyr);     library(sf)
+library(xml2);      library(spdep)
+library(surveillance); library(patchwork)
+```
+
+------------------------------------------------------------------------
+
+# Section 1: Load Data & Build Panel
+
+## 1.1 Shooting Records
+
+```{r load-data}
+file <- "Shootings_Full Data(new).xlsx"
+
+full_data <- read_excel(file, sheet = "Full Data") %>%
+  mutate(
+    DATE       = as.Date(DATE),
+    week       = floor_date(DATE, "week", week_start = 1),
+    week_index = as.integer(difftime(week, min(week, na.rm = TRUE), units = "weeks")),
+    nfsu       = as.integer(DATE >= as.Date("2024-01-01")),
+    period     = factor(if_else(DATE < as.Date("2024-01-01"),
+                                "Before NFSU", "After NFSU"),
+                        levels = c("Before NFSU", "After NFSU")),
+    season     = factor(case_when(
+      month(DATE) %in% c(12, 1, 2)  ~ "Winter",
+      month(DATE) %in% c(3, 4, 5)   ~ "Spring",
+      month(DATE) %in% c(6, 7, 8)   ~ "Summer",
+      month(DATE) %in% c(9, 10, 11) ~ "Fall"
+    ), levels = c("Winter", "Spring", "Summer", "Fall")),
+    GRID = as.character(GRID)
+  ) %>%
+  filter(!is.na(Lat), !is.na(Long), !is.na(DATE), Lat != 0, Long != 0)
+
+cat("Shooting records loaded:", nrow(full_data), "\n")
+```
+
+## 1.2 Police Grid (KMZ)
+
+```{r load-grid, message=FALSE, warning=FALSE}
+kmz_path <- "StPaul_Police_Gri_LayerToKML.kmz"
+unzip(kmz_path, exdir = tempdir(), overwrite = TRUE)
+kml_path <- list.files(tempdir(), pattern = "\\.kml$", full.names = TRUE)[1]
+
+kml_doc    <- read_xml(kml_path)
+ns         <- c(kml = "http://www.opengis.net/kml/2.2")
+placemarks <- xml_find_all(kml_doc, ".//kml:Placemark", ns)
+
+features <- lapply(placemarks, function(pm) {
+  grid_id    <- xml_text(xml_find_first(pm, "kml:name", ns))
+  poly_nodes <- xml_find_all(pm,
+    "kml:MultiGeometry/kml:Polygon/kml:outerBoundaryIs/kml:LinearRing/kml:coordinates", ns)
+  if (length(poly_nodes) == 0)
+    poly_nodes <- xml_find_all(pm,
+      "kml:Polygon/kml:outerBoundaryIs/kml:LinearRing/kml:coordinates", ns)
+
+  coords_list <- lapply(poly_nodes, function(co) {
+    pts <- strsplit(trimws(xml_text(co)), "\\s+")[[1]]
+    do.call(rbind, lapply(pts, function(p) {
+      xy <- as.numeric(strsplit(p, ",")[[1]]); c(xy[1], xy[2])
+    }))
+  })
+
+  geom <- if (length(coords_list) == 1) st_polygon(list(coords_list[[1]]))
+          else st_multipolygon(lapply(coords_list, function(m) list(m)))
+  st_sf(Name = grid_id, geometry = st_sfc(geom, crs = 4326))
+})
+
+grid_sf <- do.call(rbind, features) %>% mutate(Name = as.character(Name))
+cat("Grid cells loaded:", nrow(grid_sf), "\n")
+```
+
+## 1.3 Spatial Join & Weekly Panel
+
+```{r build-panel}
+shootings_sf <- full_data %>%
+  st_as_sf(coords = c("Long", "Lat"), crs = 4326)
+
+shootings_gridded <- st_join(shootings_sf, grid_sf, join = st_within) %>%
+  rename(grid_id = Name) %>%
+  st_drop_geometry()
+
+cat("Matched:", sum(!is.na(shootings_gridded$grid_id)),
+    "of", nrow(shootings_gridded), "records to a grid\n")
+
+all_weeks <- sort(unique(shootings_gridded$week))
+all_grids <- sort(unique(grid_sf$Name))
+
+panel <- expand.grid(week = all_weeks, grid_id = all_grids,
+                     stringsAsFactors = FALSE) %>%
+  as_tibble() %>%
+  mutate(week = as.Date(week)) %>%
+  left_join(
+    shootings_gridded %>%
+      filter(!is.na(grid_id), !is.na(week)) %>%
+      group_by(week, grid_id) %>%
+      summarize(count = n(), .groups = "drop"),
+    by = c("week", "grid_id")
+  ) %>%
+  replace_na(list(count = 0)) %>%
+  mutate(
+    nfsu       = as.integer(week >= as.Date("2024-01-01")),
+    season     = factor(case_when(
+      month(week) %in% c(12, 1, 2)  ~ "Winter",
+      month(week) %in% c(3, 4, 5)   ~ "Spring",
+      month(week) %in% c(6, 7, 8)   ~ "Summer",
+      month(week) %in% c(9, 10, 11) ~ "Fall"
+    ), levels = c("Winter", "Spring", "Summer", "Fall")),
+    week_index = as.integer(difftime(week, min(week), units = "weeks"))
+  )
+
+cat("Panel:", nrow(panel), "rows |",
+    length(all_weeks), "weeks ×", length(all_grids), "grids\n")
+cat("Overall zero proportion:", round(mean(panel$count == 0), 3), "\n")
+```
+
+## 1.4 sts Object & Shared Matrices
+
+```{r build-sts}
+all_grid_ids  <- sort(unique(panel$grid_id))
+all_week_vals <- sort(unique(panel$week))
+
+count_wide <- panel %>%
+  dplyr::select(week, grid_id, count) %>%
+  pivot_wider(names_from = grid_id, values_from = count, values_fill = 0) %>%
+  arrange(week)
+
+count_matrix <- count_wide %>% dplyr::select(-week) %>% as.matrix()
+rownames(count_matrix) <- as.character(count_wide$week)
+
+grid_sf_ordered <- grid_sf %>%
+  rename(grid_id = Name) %>%
+  filter(grid_id %in% colnames(count_matrix)) %>%
+  arrange(match(grid_id, colnames(count_matrix)))
+
+nb_full <- poly2nb(grid_sf_ordered, queen = TRUE)
+adj_mat <- nb2mat(nb_full, style = "B", zero.policy = TRUE)
+rownames(adj_mat) <- colnames(adj_mat) <- grid_sf_ordered$grid_id
+
+sts_obj <- sts(observed = count_matrix, neighbourhood = adj_mat, frequency = 52)
+
+nfsu_vec    <- as.integer(all_week_vals >= as.Date("2024-01-01"))
+nfsu_matrix <- matrix(rep(nfsu_vec, ncol(count_matrix)),
+                      nrow = nrow(count_matrix), ncol = ncol(count_matrix))
+n_obs <- sum(count_matrix)
+grid_order <- colnames(count_matrix)
+
+cat("sts object:", nrow(sts_obj), "weeks ×", ncol(sts_obj), "grids\n")
+cat("Before NFSU:", sum(nfsu_vec == 0), "weeks |",
+    "After NFSU:", sum(nfsu_vec == 1), "weeks\n")
+```
+
+------------------------------------------------------------------------
+
+# Section 2: Cluster Identification
+
+## 2.1 Global Moran's I
+
+Confirms significant spatial autocorrelation — a prerequisite for
+meaningful LISA.
+
+```{r morans-i}
+grid_totals <- panel %>%
+  group_by(grid_id) %>%
+  summarize(total = sum(count), .groups = "drop")
+
+nb_lisa <- poly2nb(grid_sf_ordered, queen = TRUE)
+w_lisa  <- nb2listw(nb_lisa, style = "W", zero.policy = TRUE)
+
+totals_ordered <- grid_totals$total[
+  match(grid_sf_ordered$grid_id, grid_totals$grid_id)]
+totals_ordered[is.na(totals_ordered)] <- 0
+
+moran_result <- moran.test(totals_ordered, w_lisa, zero.policy = TRUE)
+cat("=== Global Moran's I (Full Period) ===\n")
+cat(sprintf("I = %.4f   p-value = %s\n",
+    moran_result$estimate["Moran I statistic"],
+    format(moran_result$p.value, digits = 4)))
+cat("Significant spatial autocorrelation:", moran_result$p.value < 0.05, "\n")
+```
+
+## 2.2 LISA — Full Period, Before & After NFSU
+
+```{r run-lisa}
+run_lisa <- function(counts_vec, w, label) {
+  set.seed(42)
+  res      <- localmoran_perm(counts_vec, w, nsim = 999,
+                              zero.policy = TRUE, alternative = "two.sided")
+  lag_vals <- lag.listw(w, counts_vec, zero.policy = TRUE)
+  tibble(
+    grid_id   = grid_sf_ordered$grid_id,
+    total     = counts_vec,
+    li        = res[, "Ii"],
+    z_score   = res[, "Z.Ii"],
+    p_value   = res[, "Pr(z != E(Ii))"],
+    lag_total = lag_vals,
+    period    = label
+  ) %>%
+    mutate(
+      cluster_type = factor(case_when(
+        p_value < 0.05 & total    > mean(total) & lag_total > mean(total) ~ "High-High",
+        p_value < 0.05 & total    < mean(total) & lag_total < mean(total) ~ "Low-Low",
+        p_value < 0.05 & total    > mean(total) & lag_total < mean(total) ~ "High-Low",
+        p_value < 0.05 & total    < mean(total) & lag_total > mean(total) ~ "Low-High",
+        TRUE ~ "Not significant"
+      ), levels = c("High-High", "Low-Low", "High-Low", "Low-High", "Not significant"))
+    )
+}
+
+get_ordered_totals <- function(df) {
+  v <- df$total[match(grid_sf_ordered$grid_id, df$grid_id)]
+  v[is.na(v)] <- 0; v
+}
+
+before_totals <- panel %>% filter(nfsu == 0) %>%
+  group_by(grid_id) %>% summarize(total = sum(count), .groups = "drop")
+after_totals  <- panel %>% filter(nfsu == 1) %>%
+  group_by(grid_id) %>% summarize(total = sum(count), .groups = "drop")
+
+lisa_full   <- run_lisa(totals_ordered,                    w_lisa, "Full period")
+lisa_before <- run_lisa(get_ordered_totals(before_totals), w_lisa, "Before NFSU")
+lisa_after  <- run_lisa(get_ordered_totals(after_totals),  w_lisa, "After NFSU")
+
+cat("=== LISA Summary — Full Period ===\n")
+print(lisa_full %>% count(cluster_type))
+```
+
+### Grids That Changed Status (Before → After NFSU)
+
+```{r changed-grids}
+changed_grids <- lisa_before %>%
+  dplyr::select(grid_id, before_cluster = cluster_type) %>%
+  left_join(lisa_after %>% dplyr::select(grid_id, after_cluster = cluster_type),
+            by = "grid_id") %>%
+  filter(as.character(before_cluster) != as.character(after_cluster)) %>%
+  arrange(before_cluster, after_cluster)
+
+cat("Grids that changed cluster status:", nrow(changed_grids), "\n\n")
+print(changed_grids)
+```
+
+------------------------------------------------------------------------
+
+# Section 3: Cluster Assignment
+
+Based on the LISA results and the St. Paul Police grid map, the 27
+High-High grids split into two geographically distinct hot-spot
+neighborhoods. The 5 Low-Low grids form a single cold-spot cluster in
+the southwest.
+
+```{r cluster-assign}
+# ── CLUSTER GRID ASSIGNMENTS ──────────────────────────────────────────────────
+# Frogtown (Thomas-Dale): Dale/University/Western corridor — central St. Paul
+frogtown_grids    <- c("30", "50", "67", "68", "70", "87", "88", "89", "90", "107", "108", "109", "110")
+
+# Phalen: Arcade/Payne/Johnson Pkwy — northeast St. Paul
+phalen_grids      <- c("33", "34", "54", "55", "57", "73", "74", "75", "76",
+                       "94", "95", "96", "114", "116")
+
+# Mac-Groveland / Highland Park — persistent Low-Low cold spot, southwest
+mac_highland_grids <- c("164", "184", "185", "204", "205")
+# ──────────────────────────────────────────────────────────────────────────────
+
+cluster_list <- list(
+  frogtown     = frogtown_grids,
+  phalen       = phalen_grids,
+  mac_highland = mac_highland_grids
+)
+
+all_cluster_grids <- unique(unlist(cluster_list))
+
+cat("=== Cluster Assignment ===\n\n")
+for (nm in names(cluster_list)) {
+  cat(sprintf("  %-15s  %2d grids: %s\n",
+      nm, length(cluster_list[[nm]]),
+      paste(sort(cluster_list[[nm]]), collapse = ", ")))
+}
+cat(sprintf("\n  %-15s  %2d grids (reference)\n",
+    "Other", ncol(count_matrix) - length(all_cluster_grids)))
+```
+
+------------------------------------------------------------------------
+
+# Section 4: Background Rate per Cluster
+
+How often does each cluster get shot at, on average, per grid per week?
+This is the empirical baseline the model's endemic component must
+capture.
+
+```{r background-rates}
+# Assign cluster label to every grid
+grid_cluster_map <- tibble(grid_id = grid_order) %>%
+  mutate(cluster = case_when(
+    grid_id %in% frogtown_grids     ~ "Frogtown",
+    grid_id %in% phalen_grids       ~ "Phalen",
+    grid_id %in% mac_highland_grids ~ "Mac-Highland",
+    TRUE                            ~ "Other (reference)"
+  ))
+
+grid_weekly_mean <- panel %>%
+  group_by(grid_id) %>%
+  summarize(mean_weekly = mean(count),
+            sd_weekly   = sd(count),
+            zero_prop   = mean(count == 0),
+            .groups = "drop") %>%
+  left_join(grid_cluster_map, by = "grid_id")
+
+# Summary table by cluster
+cluster_summary <- grid_weekly_mean %>%
+  group_by(cluster) %>%
+  summarize(
+    n_grids          = n(),
+    mean_rate        = mean(mean_weekly),
+    sd_rate          = sd(mean_weekly),
+    median_zero_prop = median(zero_prop),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_rate))
+
+cat("=== Mean Weekly Shooting Rate & Sparsity by Cluster ===\n\n")
+print(cluster_summary, n = Inf)
+```
+
+## 4.1 Background Rate Bar Chart
+
+```{r bg-rate-plot, fig.height=3.5, fig.width=7}
+cluster_colors <- c(
+  "Frogtown"          = "#d7191c",
+  "Phalen"            = "#e85d1a",
+  "Mac-Highland"      = "#2c7bb6",
+  "Other (reference)" = "#aaaaaa"
+)
+
+ggplot(cluster_summary,
+       aes(x = reorder(cluster, mean_rate), y = mean_rate, fill = cluster)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_errorbar(aes(ymin = pmax(mean_rate - sd_rate, 0),
+                    ymax = mean_rate + sd_rate),
+                width = 0.2, color = "grey30") +
+  coord_flip() +
+  scale_fill_manual(values = cluster_colors) +
+  labs(
+    title    = "Empirical Background Rate by Cluster",
+    subtitle = "Mean ± SD of weekly shooting count per grid",
+    x = NULL, y = "Mean weekly count per grid"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## 4.2 Zero-Count Sparsity by Cluster
+
+```{r sparsity-plot, fig.height=4, fig.width=9}
+# Per-grid zero proportions, ordered within cluster
+grid_weekly_mean <- grid_weekly_mean %>%
+  mutate(cluster = factor(cluster,
+    levels = c("Frogtown", "Phalen", "Mac-Highland", "Other (reference)")))
+
+p_strip <- ggplot(grid_weekly_mean,
+                  aes(x = reorder(grid_id, zero_prop), y = zero_prop,
+                      fill = cluster)) +
+  geom_col(width = 0.8, show.legend = FALSE) +
+  facet_wrap(~cluster, scales = "free_x", nrow = 1) +
+  scale_fill_manual(values = cluster_colors) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title    = "Zero-Count Proportion per Grid, by Cluster",
+    subtitle = "Each bar = one grid | Higher = more sparse",
+    x = "Grid (ordered by sparsity within cluster)", y = "% weeks with zero shootings"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+p_box <- ggplot(grid_weekly_mean,
+                aes(x = cluster, y = zero_prop, fill = cluster)) +
+  geom_boxplot(width = 0.5, outlier.size = 0.8, show.legend = FALSE) +
+  scale_fill_manual(values = cluster_colors) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Sparsity Distribution by Cluster",
+       x = NULL, y = "% weeks with zero shootings") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+p_strip / p_box + plot_layout(heights = c(2, 1))
+```
+
+```{r sparsity-summary}
+cat("=== Sparsity Summary by Cluster ===\n\n")
+cat(sprintf("Overall panel zero proportion: %.1f%%\n\n",
+    mean(panel$count == 0) * 100))
+
+grid_weekly_mean %>%
+  group_by(cluster) %>%
+  summarize(
+    grids        = n(),
+    median_zeros = scales::percent(median(zero_prop), accuracy = 0.1),
+    min_zeros    = scales::percent(min(zero_prop),    accuracy = 0.1),
+    max_zeros    = scales::percent(max(zero_prop),    accuracy = 0.1),
+    .groups = "drop"
+  ) %>%
+  arrange(median_zeros) %>%
+  print(n = Inf)
+```
+
+------------------------------------------------------------------------
+
+# Section 5: Spatial Visualizations
+
+## 5.1 Shooting Heatmap (Total Counts per Grid)
+
+```{r heatmap, fig.height=5.5, fig.width=6}
+heatmap_sf <- grid_sf_ordered %>%
+  left_join(grid_totals, by = "grid_id")
+
+ggplot(heatmap_sf) +
+  geom_sf(aes(fill = total), color = "white", linewidth = 0.15) +
+  scale_fill_gradientn(
+    colours  = c("#f7f7f7", "#fddbc7", "#f4a582", "#d6604d", "#b2182b", "#67001f"),
+    name     = "Total\nshootings",
+    na.value = "grey90"
+  ) +
+  labs(
+    title    = "Total Non-Fatal Shootings per Grid",
+    subtitle = "Full study period (all weeks)"
+  ) +
+  theme_minimal() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank())
+```
+
+## 5.2 LISA Cluster Maps
+
+```{r lisa-maps, fig.height=5, fig.width=11}
+lisa_color <- c(
+  "High-High"       = "#d7191c",
+  "Low-Low"         = "#2c7bb6",
+  "High-Low"        = "#fdae61",
+  "Low-High"        = "#abd9e9",
+  "Not significant" = "#f0f0f0"
+)
+
+plot_lisa_map <- function(lisa_df, label) {
+  grid_sf_ordered %>%
+    left_join(lisa_df %>% dplyr::select(grid_id, cluster_type), by = "grid_id") %>%
+    ggplot() +
+    geom_sf(aes(fill = cluster_type), color = "white", linewidth = 0.2) +
+    scale_fill_manual(values = lisa_color, name = "LISA cluster\n(p < 0.05)",
+                      drop = FALSE) +
+    labs(title = label) +
+    theme_minimal() +
+    theme(axis.text = element_blank(), axis.ticks = element_blank(),
+          legend.position = "bottom", plot.title = element_text(size = 11))
+}
+
+plot_lisa_map(lisa_before, "Before NFSU") +
+plot_lisa_map(lisa_after,  "After NFSU")
+```
+
+```{r lisa-full-map, fig.height=5.5, fig.width=6}
+plot_lisa_map(lisa_full, "Full Study Period") +
+  theme(legend.position = "right")
+```
+
+## 5.3 Neighborhood Cluster Assignment Map
+
+```{r cluster-map, fig.height=5.5, fig.width=6}
+neighborhood_colors <- c(
+  "Frogtown"          = "#d7191c",
+  "Phalen"            = "#e85d1a",
+  "Mac-Highland"      = "#2c7bb6",
+  "Other (reference)" = "#f0f0f0"
+)
+
+grid_sf_ordered %>%
+  left_join(grid_cluster_map, by = "grid_id") %>%
+  mutate(cluster = factor(cluster,
+    levels = c("Frogtown", "Phalen", "Mac-Highland", "Other (reference)"))) %>%
+  ggplot() +
+  geom_sf(aes(fill = cluster), color = "white", linewidth = 0.2) +
+  scale_fill_manual(values = neighborhood_colors, name = "Neighborhood\ncluster") +
+  labs(
+    title    = "Neighborhood Cluster Assignment Map",
+    subtitle = "Two High-High hot spots · One Low-Low cold spot · Reference"
+  ) +
+  theme_minimal() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank(),
+        legend.position = "right")
+```
+
+------------------------------------------------------------------------
+
+# Section 6: Build Cluster Covariate Matrices
+
+```{r cluster-matrices}
+make_cluster_matrix <- function(ids) {
+  flag <- as.integer(grid_order %in% ids)
+  matrix(flag, nrow = nrow(count_matrix), ncol = ncol(count_matrix),
+         byrow = TRUE, dimnames = list(NULL, grid_order))
+}
+
+mat_frogtown     <- make_cluster_matrix(frogtown_grids)
+mat_phalen       <- make_cluster_matrix(phalen_grids)
+mat_mac_highland <- make_cluster_matrix(mac_highland_grids)
+
+# "Other" = all grids not in any named cluster — this is the endemic reference group
+other_grids  <- setdiff(grid_order, all_cluster_grids)
+mat_other    <- make_cluster_matrix(other_grids)
+
+cat("Covariate matrices built:\n")
+cat(sprintf("  frogtown     : %d grids flagged\n", sum(mat_frogtown[1, ])))
+cat(sprintf("  phalen       : %d grids flagged\n", sum(mat_phalen[1, ])))
+cat(sprintf("  mac_highland : %d grids flagged\n", sum(mat_mac_highland[1, ])))
+cat(sprintf("  other (ref)  : %d grids (reference — captured by end.1 intercept)\n",
+    sum(mat_other[1, ])))
+cat(sprintf("  TOTAL        : %d grids (should equal %d)\n",
+    sum(mat_frogtown[1,]) + sum(mat_phalen[1,]) +
+    sum(mat_mac_highland[1,]) + sum(mat_other[1,]),
+    ncol(count_matrix)))
+```
+
+------------------------------------------------------------------------
+
+# Section 7: Model Fitting
+
+## 7.1 Baseline — M1 (Warm Start)
+
+```{r fit-m1}
+ctrl_m1 <- list(ar = list(f = ~ 1), end = list(f = ~ 1), family = "Poisson")
+fit_m1  <- tryCatch(hhh4(sts_obj, control = ctrl_m1),
+                    error = function(e) { cat("M1:", conditionMessage(e)); NULL })
+cat("M1 converged:", !is.null(fit_m1) && fit_m1$convergence, "\n")
+```
+
+## 7.2 Model M2a — Global Background + NFSU-Stratified φ
+
+$$\lambda_{i,t} = e^{\beta_0} + \phi_j \cdot Y_{i,t-1}$$
+
+One background rate for all grids. $\phi_j$ differs before vs. after
+NFSU. This is the **baseline** for comparison.
+
+```{r fit-m2a}
+ctrl_m2a <- list(
+  ar        = list(f = ~ 1 + nfsu),
+  end       = list(f = ~ 1),
+  family    = "Poisson",
+  data      = list(nfsu = nfsu_matrix),
+  optimizer = list(stop = list(iter.max = 300, tol = 1e-6)),
+  start     = list(fixed = c(
+    "ar.1"    = coef(fit_m1)["ar.1"],
+    "ar.nfsu" = 0,
+    "end.1"   = coef(fit_m1)["end.1"]
+  ))
+)
+
+fit_m2a <- suppressWarnings(tryCatch(
+  hhh4(sts_obj, control = ctrl_m2a),
+  error = function(e) { cat("M2a:", conditionMessage(e)); NULL }
+))
+
+if (!is.null(fit_m2a)) {
+  cat("=== M2a: Global Background ===\n")
+  cat("Converged:", fit_m2a$convergence, "\n\n")
+  print(summary(fit_m2a))
+
+  c0  <- fit_m2a$coefficients
+  se0 <- sqrt(diag(fit_m2a$cov))
+
+  # φ before NFSU: exp(ar.1)
+  log_phi_before <- c0["ar.1"]
+  se_phi_before  <- se0["ar.1"]
+
+  # φ after NFSU: exp(ar.1 + ar.nfsu)  — delta-method SE
+  log_phi_after  <- c0["ar.1"] + c0["ar.nfsu"]
+  se_phi_after   <- sqrt(se0["ar.1"]^2 + se0["ar.nfsu"]^2 +
+                           2 * fit_m2a$cov["ar.1", "ar.nfsu"])
+
+  cat("\n--- φ (contagion) estimates with 95% CI (delta method) ---\n")
+  cat(sprintf("  φ before NFSU : %.4f  [%.4f, %.4f]\n",
+      exp(log_phi_before),
+      exp(log_phi_before - 1.96 * se_phi_before),
+      exp(log_phi_before + 1.96 * se_phi_before)))
+  cat(sprintf("  φ after  NFSU : %.4f  [%.4f, %.4f]\n",
+      exp(log_phi_after),
+      exp(log_phi_after  - 1.96 * se_phi_after),
+      exp(log_phi_after  + 1.96 * se_phi_after)))
+  cat(sprintf("  Change        : %+.1f%%\n",
+      (exp(log_phi_after) - exp(log_phi_before)) / exp(log_phi_before) * 100))
+  cat(sprintf("\n  AIC: %.2f   BIC: %.2f\n",
+      -2 * fit_m2a$loglikelihood + 2 * length(c0),
+      -2 * fit_m2a$loglikelihood + log(n_obs) * length(c0)))
+}
+```
+
+## 7.3 Model M2a(N) — Neighborhood Cluster Background + NFSU-Stratified φ
+
+$$\lambda_{i,t} = e^{\,\beta_0 \;+\; \beta_{\text{FT}}\,\mathbf{1}[i \in \text{Frogtown}] \;+\; \beta_{\text{PH}}\,\mathbf{1}[i \in \text{Phalen}] \;+\; \beta_{\text{MH}}\,\mathbf{1}[i \in \text{Mac-Highland}]} + \phi_j \cdot Y_{i,t-1}$$
+
+Three neighborhood-level background offsets; all other grids form the
+reference ($\beta_0$). The AR structure is identical to M2a.
+
+```{r fit-m2an}
+ctrl_m2an <- list(
+  ar        = list(f = ~ 1 + nfsu),
+  end       = list(f = ~ 1 + frogtown + phalen + mac_highland),
+  family    = "Poisson",
+  data      = list(
+    nfsu        = nfsu_matrix,
+    frogtown    = mat_frogtown,
+    phalen      = mat_phalen,
+    mac_highland = mat_mac_highland
+  ),
+  optimizer = list(stop = list(iter.max = 500, tol = 1e-6)),
+  start     = list(fixed = c(
+    "ar.1"            = coef(fit_m2a)["ar.1"],
+    "ar.nfsu"         = coef(fit_m2a)["ar.nfsu"],
+    "end.1"           = coef(fit_m2a)["end.1"],
+    "end.frogtown"    = 0,
+    "end.phalen"      = 0,
+    "end.mac_highland" = 0
+  ))
+)
+
+fit_m2an <- suppressWarnings(tryCatch(
+  hhh4(sts_obj, control = ctrl_m2an),
+  error = function(e) { cat("M2a(N):", conditionMessage(e)); NULL }
+))
+
+if (!is.null(fit_m2an)) {
+  cat("=== M2a(N): Neighborhood Cluster Background ===\n")
+  cat("Converged:", fit_m2an$convergence, "\n\n")
+  print(summary(fit_m2an))
+
+  cn  <- fit_m2an$coefficients
+  sen <- sqrt(diag(fit_m2an$cov))
+
+  # φ before NFSU
+  log_phi_before_n <- cn["ar.1"]
+  se_phi_before_n  <- sen["ar.1"]
+
+  # φ after NFSU — delta-method SE
+  log_phi_after_n  <- cn["ar.1"] + cn["ar.nfsu"]
+  se_phi_after_n   <- sqrt(sen["ar.1"]^2 + sen["ar.nfsu"]^2 +
+                             2 * fit_m2an$cov["ar.1", "ar.nfsu"])
+
+  cat("\n--- φ (contagion) estimates with 95% CI (delta method) ---\n")
+  cat(sprintf("  φ before NFSU : %.4f  [%.4f, %.4f]\n",
+      exp(log_phi_before_n),
+      exp(log_phi_before_n - 1.96 * se_phi_before_n),
+      exp(log_phi_before_n + 1.96 * se_phi_before_n)))
+  cat(sprintf("  φ after  NFSU : %.4f  [%.4f, %.4f]\n",
+      exp(log_phi_after_n),
+      exp(log_phi_after_n  - 1.96 * se_phi_after_n),
+      exp(log_phi_after_n  + 1.96 * se_phi_after_n)))
+  cat(sprintf("  Change        : %+.1f%%\n",
+      (exp(log_phi_after_n) - exp(log_phi_before_n)) / exp(log_phi_before_n) * 100))
+
+  cat("\n--- Neighborhood background-rate offsets (reference = Other grids) ---\n")
+  end_terms <- c("end.frogtown", "end.phalen", "end.mac_highland")
+  for (nm in end_terms) {
+    lo_rr <- exp(cn[nm] - 1.96 * sen[nm])
+    hi_rr <- exp(cn[nm] + 1.96 * sen[nm])
+    cat(sprintf("  %-25s  log(RR) = %+.4f   RR = %.3f  [%.3f, %.3f]\n",
+        nm, cn[nm], exp(cn[nm]), lo_rr, hi_rr))
+  }
+  cat(sprintf("\n  AIC: %.2f   BIC: %.2f\n",
+      -2 * fit_m2an$loglikelihood + 2 * length(cn),
+      -2 * fit_m2an$loglikelihood + log(n_obs) * length(cn)))
+}
+```
+
+------------------------------------------------------------------------
+
+# Section 8: Model Comparison
+
+## 8.1 φ Comparison — Before & After NFSU
+
+```{r phi-comparison, fig.height=3.5, fig.width=7}
+if (!is.null(fit_m2a) && !is.null(fit_m2an)) {
+  c0 <- fit_m2a$coefficients
+  cn <- fit_m2an$coefficients
+  se0 <- sqrt(diag(fit_m2a$cov))
+  sen <- sqrt(diag(fit_m2an$cov))
+
+  phi_df <- tibble(
+    model  = rep(c("M2a", "M2a(N)"), each = 2),
+    period = rep(c("Before NFSU", "After NFSU"), 2),
+    log_phi = c(c0["ar.1"],
+                c0["ar.1"] + c0["ar.nfsu"],
+                cn["ar.1"],
+                cn["ar.1"] + cn["ar.nfsu"]),
+    # Delta method SE for after: sqrt(var(ar.1) + var(ar.nfsu) + 2*cov)
+    se_log = c(
+      se0["ar.1"],
+      sqrt(se0["ar.1"]^2 + se0["ar.nfsu"]^2 +
+             2 * fit_m2a$cov["ar.1", "ar.nfsu"]),
+      sen["ar.1"],
+      sqrt(sen["ar.1"]^2 + sen["ar.nfsu"]^2 +
+             2 * fit_m2an$cov["ar.1", "ar.nfsu"])
+    )
+  ) %>%
+    mutate(
+      phi = exp(log_phi),
+      lo  = exp(log_phi - 1.96 * se_log),
+      hi  = exp(log_phi + 1.96 * se_log),
+      period = factor(period, levels = c("Before NFSU", "After NFSU"))
+    )
+
+  ggplot(phi_df, aes(x = period, y = phi, color = model, group = model)) +
+    geom_line(linewidth = 0.8, linetype = "dashed") +
+    geom_pointrange(aes(ymin = lo, ymax = hi),
+                    position = position_dodge(width = 0.15), size = 0.7) +
+    scale_color_manual(values = c("M2a" = "darkgreen", "M2a(N)" = "darkorange")) +
+    labs(
+      title    = "φ (Contagion Parameter) Before and After NFSU",
+      subtitle = "Point estimates ± 95% CI (delta method) | Lower φ = less shooting-to-shooting spread",
+      x = NULL, y = "φ", color = "Model"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "bottom")
+}
+```
+
+## 8.2 Neighborhood Background-Rate Ratios
+
+```{r rr-plot, fig.height=3.5, fig.width=7}
+if (!is.null(fit_m2an)) {
+  cn  <- fit_m2an$coefficients
+  sen <- sqrt(diag(fit_m2an$cov))
+  end_nms <- c("end.frogtown", "end.phalen", "end.mac_highland")
+
+  rr_df <- tibble(
+    term    = end_nms,
+    log_rr  = cn[end_nms],
+    se      = sen[end_nms]
+  ) %>%
+    mutate(
+      rr    = exp(log_rr),
+      lo    = exp(log_rr - 1.96 * se),
+      hi    = exp(log_rr + 1.96 * se),
+      sig   = !(lo <= 1 & hi >= 1),
+      label = c("Frogtown", "Phalen", "Mac-Highland")
+    )
+
+  ggplot(rr_df, aes(x = reorder(label, rr), y = rr, color = sig)) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "grey50") +
+    geom_pointrange(aes(ymin = lo, ymax = hi), size = 0.9) +
+    coord_flip() +
+    scale_color_manual(
+      values = c("TRUE" = "#d7191c", "FALSE" = "grey60"),
+      labels = c("TRUE" = "CI excludes 1", "FALSE" = "CI includes 1"),
+      name = ""
+    ) +
+    labs(
+      title    = "Neighborhood Background-Rate Ratios vs Reference",
+      subtitle = "M2a(N) | Reference = non-cluster grids (Other)",
+      x = NULL, y = "Rate Ratio exp(β)"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "bottom")
+}
+```
+
+## 8.3 AIC / BIC / Log-Likelihood Table
+
+```{r fit-table}
+make_row <- function(fit, name) {
+  if (is.null(fit)) return(NULL)
+  k  <- length(fit$coefficients)
+  ll <- fit$loglikelihood
+  tibble(Model = name, Params = k,
+         LogLik = round(ll, 2),
+         AIC    = round(-2 * ll + 2 * k, 2),
+         BIC    = round(-2 * ll + log(n_obs) * k, 2),
+         Converged = fit$convergence)
+}
+
+tbl <- bind_rows(
+  make_row(fit_m2a,  "M2a  — Global background"),
+  make_row(fit_m2an, "M2a(N) — Neighborhood clusters")
+)
+cat("=== Model Fit Statistics ===\n\n")
+print(tbl, n = Inf)
+```
+
+## 8.4 Likelihood Ratio Test
+
+```{r lrt}
+if (!is.null(fit_m2a) && !is.null(fit_m2an)) {
+  ll_0   <- fit_m2a$loglikelihood
+  ll_1   <- fit_m2an$loglikelihood
+  k_0    <- length(fit_m2a$coefficients)
+  k_1    <- length(fit_m2an$coefficients)
+  lrt    <- 2 * (ll_1 - ll_0)
+  df_lrt <- k_1 - k_0
+  p_lrt  <- pchisq(lrt, df = df_lrt, lower.tail = FALSE)
+
+  cat(sprintf("LRT: M2a vs M2a(N)\n  χ² = %.4f   df = %d   p = %s\n\n",
+      lrt, df_lrt, format(p_lrt, digits = 4)))
+  if (p_lrt < 0.05) {
+    cat("M2a(N) fits significantly better than M2a (p < 0.05).\n")
+  } else {
+    cat("No significant improvement over M2a (p ≥ 0.05).\n")
+  }
+}
+```
+
+------------------------------------------------------------------------
+
+# Section 9: Diagnostics
+
+Helper functions used throughout.
+
+```{r diag-helpers}
+get_fit_obs <- function(fit_obj) {
+  fit_mat <- fitted(fit_obj)
+  n_fit   <- nrow(fit_mat)
+  idx     <- (nrow(count_matrix) - n_fit + 1):nrow(count_matrix)
+  obs_mat <- observed(sts_obj)[idx, ]
+  cols    <- intersect(colnames(obs_mat), colnames(fit_mat))
+  list(fit = fit_mat[, cols, drop = FALSE],
+       obs = obs_mat[, cols, drop = FALSE],
+       wks = as.Date(rownames(count_matrix))[idx])
+}
+
+get_pearson_df <- function(fit_obj, label) {
+  d   <- get_fit_obs(fit_obj)
+  prs <- (d$obs - d$fit) / sqrt(d$fit + 1e-8)
+  data.frame(resid = as.vector(prs), model = label)
+}
+
+get_deviance_df <- function(fit_obj, label) {
+  d  <- get_fit_obs(fit_obj)
+  y  <- d$obs; mu <- d$fit
+  dr <- sign(y - mu) * sqrt(2 * pmax(
+    y * log((y + 1e-8) / (mu + 1e-8)) - (y - mu), 0))
+  data.frame(week = rep(d$wks, ncol(dr)),
+             resid = as.vector(dr), model = label)
+}
+
+both <- !is.null(fit_m2a) && !is.null(fit_m2an)
+```
+
+## 9.1 Fitted vs Observed — City-Wide Weekly Total
+
+```{r fitted-vs-obs, fig.height=4, fig.width=10}
+if (both) {
+  make_fit_df <- function(fit_obj, label) {
+    d <- get_fit_obs(fit_obj)
+    data.frame(week = d$wks, observed = rowSums(d$obs),
+               fitted = rowSums(d$fit), model = label)
+  }
+
+  fit_df <- bind_rows(make_fit_df(fit_m2a,  "M2a"),
+                      make_fit_df(fit_m2an, "M2a(N)"))
+
+  ggplot(fit_df, aes(x = week)) +
+    geom_line(aes(y = observed), color = "steelblue", linewidth = 0.7, alpha = 0.7) +
+    geom_line(aes(y = fitted, color = model), linewidth = 0.8, linetype = "dashed") +
+    geom_vline(xintercept = as.Date("2024-01-01"),
+               color = "red", linetype = "dotted") +
+    annotate("text", x = as.Date("2024-01-01"), y = Inf,
+             label = "NFSU start", color = "red",
+             vjust = 2, hjust = -0.1, size = 3) +
+    scale_color_manual(values = c("M2a" = "darkgreen", "M2a(N)" = "darkorange")) +
+    facet_wrap(~model) +
+    labs(title = "Fitted vs Observed — City-Wide Weekly Total",
+         subtitle = "Blue = observed | Dashed = fitted | Red dotted = NFSU start",
+         x = "Week", y = "Total Shootings") +
+    theme_minimal() + theme(legend.position = "none")
+}
+```
+
+## 9.2 ACF / PACF of Pearson Residuals
+
+```{r acf-pacf, fig.height=4}
+plot_acf_pacf <- function(fit_obj, label) {
+  if (is.null(fit_obj)) return(invisible(NULL))
+  d        <- get_fit_obs(fit_obj)
+  prs      <- (d$obs - d$fit) / sqrt(d$fit + 1e-8)
+  resid_wk <- rowMeans(prs, na.rm = TRUE)
+  op <- par(no.readonly = TRUE); on.exit(par(op), add = TRUE)
+  par(mfrow = c(1, 2))
+  acf(resid_wk,  main = paste("ACF —",  label), lag.max = 30, xlab = "Lag (weeks)")
+  pacf(resid_wk, main = paste("PACF —", label), lag.max = 30, xlab = "Lag (weeks)")
+}
+
+plot_acf_pacf(fit_m2a,  "M2a")
+plot_acf_pacf(fit_m2an, "M2a(N)")
+```
+
+## 9.3 Pearson Residual Distribution
+
+```{r resid-dist, fig.height=4, fig.width=10}
+if (both) {
+  resid_df <- bind_rows(get_pearson_df(fit_m2a,  "M2a"),
+                        get_pearson_df(fit_m2an, "M2a(N)"))
+
+  ggplot(resid_df %>% filter(abs(resid) < 10), aes(x = resid, fill = model)) +
+    geom_histogram(binwidth = 0.2, color = "white", alpha = 0.85) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey30") +
+    facet_wrap(~model) +
+    scale_fill_manual(values = c("M2a" = "darkgreen", "M2a(N)" = "darkorange")) +
+    labs(title = "Pearson Residual Distribution — M2a vs M2a(N)",
+         subtitle = "Clipped at |residual| < 10 for readability",
+         x = "Pearson Residual", y = "Count") +
+    theme_minimal() + theme(legend.position = "none")
+}
+```
+
+## 9.4 QQ Plot of Pearson Residuals
+
+```{r qq-plot, fig.height=4, fig.width=10}
+if (both) {
+  ggplot(resid_df %>% filter(abs(resid) < 10),
+         aes(sample = resid, color = model)) +
+    stat_qq(alpha = 0.3, size = 0.5) +
+    stat_qq_line() +
+    facet_wrap(~model) +
+    scale_color_manual(values = c("M2a" = "darkgreen", "M2a(N)" = "darkorange")) +
+    labs(title = "QQ Plot of Pearson Residuals — M2a vs M2a(N)",
+         subtitle = "Closer to diagonal = better-specified model",
+         x = "Theoretical Quantiles", y = "Sample Quantiles") +
+    theme_minimal() + theme(legend.position = "none")
+}
+```
+
+## 9.5 Mean Deviance Residuals Over Time
+
+```{r deviance-resid, fig.height=4, fig.width=10}
+if (both) {
+  dev_df <- bind_rows(
+    get_deviance_df(fit_m2a,  "M2a"),
+    get_deviance_df(fit_m2an, "M2a(N)")
+  ) %>%
+    group_by(week, model) %>%
+    summarize(mean_dev = mean(resid, na.rm = TRUE), .groups = "drop")
+
+  ggplot(dev_df, aes(x = week, y = mean_dev, color = model)) +
+    geom_line(linewidth = 0.7, alpha = 0.8) +
+    geom_hline(yintercept = c(-2, 2), linetype = "dashed", color = "grey50") +
+    geom_hline(yintercept = 0, color = "grey30") +
+    geom_vline(xintercept = as.Date("2024-01-01"),
+               color = "red", linetype = "dotted") +
+    scale_color_manual(values = c("M2a" = "darkgreen", "M2a(N)" = "darkorange")) +
+    facet_wrap(~model) +
+    labs(title = "Mean Deviance Residuals Over Time — M2a vs M2a(N)",
+         subtitle = "Dashed bands at ±2 | Red dotted = NFSU start",
+         x = "Week", y = "Mean deviance residual") +
+    theme_minimal() + theme(legend.position = "none")
+}
+```
+
+------------------------------------------------------------------------
+
+# Section 10: Summary
+
+```{r final-summary}
+cat("╔══════════════════════════════════════════════════════════════════╗\n")
+cat("║         M2a vs M2a(N) — Final Comparison Summary                ║\n")
+cat("╚══════════════════════════════════════════════════════════════════╝\n\n")
+
+cat("── Cluster Assignment ──────────────────────────────────────────────\n")
+for (nm in names(cluster_list))
+  cat(sprintf("  %-15s  %d grids\n", nm, length(cluster_list[[nm]])))
+cat(sprintf("  %-15s  %d grids (reference — endemic intercept)\n\n",
+    "Other", length(other_grids)))
+
+cat("── Sparsity ────────────────────────────────────────────────────────\n")
+cat(sprintf("  Overall panel: %.1f%% zeros\n\n",
+    mean(panel$count == 0) * 100))
+
+if (!is.null(fit_m2a) && !is.null(fit_m2an)) {
+  cat("── Model Fit ───────────────────────────────────────────────────────\n")
+  print(tbl)
+
+  cat(sprintf("\n  LRT: χ² = %.4f  df = %d  p = %s\n\n",
+      lrt, df_lrt, format(p_lrt, digits = 4)))
+
+  c0 <- fit_m2a$coefficients
+  cn <- fit_m2an$coefficients
+  se0 <- sqrt(diag(fit_m2a$cov))
+  sen <- sqrt(diag(fit_m2an$cov))
+
+  # Recompute log-phi and SE for CIs
+  lp0_b <- c0["ar.1"];  se0_b <- se0["ar.1"]
+  lp0_a <- c0["ar.1"] + c0["ar.nfsu"]
+  se0_a <- sqrt(se0["ar.1"]^2 + se0["ar.nfsu"]^2 + 2 * fit_m2a$cov["ar.1","ar.nfsu"])
+
+  lpn_b <- cn["ar.1"];  sen_b <- sen["ar.1"]
+  lpn_a <- cn["ar.1"] + cn["ar.nfsu"]
+  sen_a <- sqrt(sen["ar.1"]^2 + sen["ar.nfsu"]^2 + 2 * fit_m2an$cov["ar.1","ar.nfsu"])
+
+  cat("── φ Estimates with 95% CI (delta method) ──────────────────────────\n")
+  cat(sprintf("  %-30s  φ_before = %.4f [%.4f, %.4f]\n",
+      "M2a  (global)",
+      exp(lp0_b), exp(lp0_b - 1.96*se0_b), exp(lp0_b + 1.96*se0_b)))
+  cat(sprintf("  %-30s  φ_after  = %.4f [%.4f, %.4f]   Δ = %+.1f%%\n",
+      "",
+      exp(lp0_a), exp(lp0_a - 1.96*se0_a), exp(lp0_a + 1.96*se0_a),
+      (exp(lp0_a) - exp(lp0_b)) / exp(lp0_b) * 100))
+  cat(sprintf("  %-30s  φ_before = %.4f [%.4f, %.4f]\n",
+      "M2a(N) (neighborhood)",
+      exp(lpn_b), exp(lpn_b - 1.96*sen_b), exp(lpn_b + 1.96*sen_b)))
+  cat(sprintf("  %-30s  φ_after  = %.4f [%.4f, %.4f]   Δ = %+.1f%%\n\n",
+      "",
+      exp(lpn_a), exp(lpn_a - 1.96*sen_a), exp(lpn_a + 1.96*sen_a),
+      (exp(lpn_a) - exp(lpn_b)) / exp(lpn_b) * 100))
+
+  cat("── Background Rate Offsets — M2a(N) ───────────────────────────────\n")
+  cat(sprintf("  %-25s  Reference = Other (%d grids, endemic intercept)\n",
+      "", length(other_grids)))
+  for (nm in c("end.frogtown", "end.phalen", "end.mac_highland")) {
+    lo_rr <- exp(cn[nm] - 1.96 * sen[nm])
+    hi_rr <- exp(cn[nm] + 1.96 * sen[nm])
+    cat(sprintf("  %-25s  log(RR)=%+.4f   RR=%.3f  [%.3f, %.3f]\n",
+        nm, cn[nm], exp(cn[nm]), lo_rr, hi_rr))
+  }
+
+  cat(sprintf("\n  Convergence — M2a: %s | M2a(N): %s\n",
+      fit_m2a$convergence, fit_m2an$convergence))
+}
+```
